@@ -36,6 +36,12 @@ NUM_CARDS = 2098
 # Card artwork table
 ARTWORK_TABLE_BASE = 0x15B5C00
 
+# Card name alphabetical sort table
+NAME_SORT_TABLE_BASE = 0x1832606  # 2 bytes per entry, little endian
+
+NAME_SORT_EXCLUDE_START = 2080  # 0-indexed, inclusive
+NAME_SORT_EXCLUDE_END = 2097    # 0-indexed, inclusive
+
 class ArtworkEntry:
     def __init__(self, index, unk_halfword, card_name_index):
         self.index = index                 # artwork slot index (0..2330)
@@ -132,6 +138,71 @@ class RomEditorApp(tk.Tk):
         self._load_text_mappings()
         self._load_json_mappings()
         self._build_ui()
+
+    def _write_name_sort_table(self, rom_data):
+        """
+        Build an alphabetical index of card names based on the ASCII
+        names currently in memory, and write it to the sort table at
+        NAME_SORT_TABLE_BASE.
+
+        Rules (per user spec):
+          - Use card.name (ASCII text) for comparison.
+          - Exclude card indices 2081–2097 (0-indexed).
+          - If two names are the same, they get the same number.
+          - Numbers do NOT have to count up to 2081.
+          - We write (alphabetical_index + 1) because index 0 is unused.
+
+        We write values in card index order, i.e., entry for card i
+        goes to NAME_SORT_TABLE_BASE + i*2, for all i NOT in the excluded
+        range. Excluded indices are left unchanged in the ROM.
+        """
+        if not self.cards:
+            return
+
+        # 1) Build list of (name, index) for the included cards
+        included = []
+        for i, card in enumerate(self.cards[1:]):
+            if NAME_SORT_EXCLUDE_START <= i <= NAME_SORT_EXCLUDE_END:
+                continue  # skip these
+            included.append((card.name, i))
+
+        if not included:
+            return
+
+        # 2) Sort by ASCII name
+        included.sort(key=lambda x: x[0])
+
+        # 3) Assign an alphabetical rank to each unique name
+        #    same name => same rank
+        name_to_rank = {}
+        rank = 0
+        last_name = None
+
+        for name, _idx in included:
+            if name != last_name:
+                # new unique name -> new rank
+                name_to_rank[name] = rank
+                rank += 1
+                last_name = name
+            # if name == last_name, it reuses the same rank
+
+        # 4) For each card index (0..len(self.cards)-1),
+        #    write its alphabetical index+1 at NAME_SORT_TABLE_BASE + i*2
+        for i, card in enumerate(self.cards[1:]):
+            # Skip excluded range entirely, leave whatever is currently in the ROM
+            if NAME_SORT_EXCLUDE_START <= i <= NAME_SORT_EXCLUDE_END:
+                continue
+
+            name = card.name
+            # Should always be present, but fall back to 0 if something is odd
+            rank = name_to_rank.get(name, 0)
+            sort_value = rank + 1  # 1-based, since 0 is unused
+
+            off = NAME_SORT_TABLE_BASE + i * 2
+            if off + 2 > len(rom_data):
+                break
+
+            self._write_u16(rom_data, off, sort_value)
 
     def _parse_artworks(self):
         data = self.rom_data
@@ -793,6 +864,9 @@ class RomEditorApp(tk.Tk):
         # After all cards, write artwork table
         self._write_artwork_table(rom_copy)
 
+        # Finally, rebuild and write the alphabetical name sort table
+        self._write_name_sort_table(rom_copy)
+
     # =========================
     # CARD ID UI
     # =========================
@@ -1034,7 +1108,7 @@ class RomEditorApp(tk.Tk):
                 break
 
             # Write first halfword
-            self._write_u16(rom_data, off, entry.unk_halfword - 1)
+            self._write_u16(rom_data, off, entry.unk_halfword)
 
             # Write second halfword
             if entry.card_name_index > 0:
