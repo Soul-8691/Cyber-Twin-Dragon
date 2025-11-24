@@ -17,52 +17,50 @@ CARD_DESC_PTR_BASE = 0x15BD65C
 TEXT_BASE = 0x15BF724
 TEXT_LIMIT = 0x162248A  # exclusive upper bound for searching free space
 
-# Card stats table
+# Primary card stats table
 CARD_STATS_BASE = 0x18169B8
 CARD_STATS_SIZE = 0x16  # 0x16 bytes per card
+
+# Secondary card stats table
+SECOND_CARD_STATS_BASE = 0x1821E04
+SECOND_CARD_STATS_SIZE = 0x16
+SECOND_STATS_COUNT = 2648  # you specified this
 
 # Card ID table (Konami ID -> card name index or 0xFFFF)
 CARD_ID_TABLE_BASE = 0x15B7CCC
 KONAMI_ID_BASE = 4007  # Konami ID offset
 
-# Number of entries in each table:
-#   (0x15BD65C - 0x15BB594) / 4 = 2098
+# Number of card name entries
 NUM_CARDS = 2098
 
 
 class CardEntry:
-    def __init__(self, index,
-                 name, desc,
-                 name_ptr_off, desc_ptr_off,
-                 name_addr, desc_addr,
-                 name_len, desc_len,
-                 konami_id, card_id_index,
-                 artwork_id, edited_flag,
-                 atk, deff, level,
-                 race, attribute, type_, st_race, padding):
+    def __init__(
+        self, index,
+        name, desc,
+        name_ptr_off, desc_ptr_off,
+        name_addr, desc_addr,
+        name_len, desc_len,
+        konami_id, card_id_index,
+        artwork_id, edited_flag,
+        atk, deff, level,
+        race, attribute, type_, st_race, padding
+    ):
         self.index = index
 
-        # CURRENT text strings (edited in UI)
+        # Text
         self.name = name
         self.desc = desc
-
-        # Pointer offsets (absolute file offsets where 4-byte relative pointers live)
         self.name_ptr_off = name_ptr_off
         self.desc_ptr_off = desc_ptr_off
-
-        # CURRENT addresses (can change if repointed)
         self.name_addr = name_addr
         self.desc_addr = desc_addr
-
-        # Slot sizes: how many bytes were originally / currently allocated
-        # (string length + 1 terminator)
         self.name_slot_size = name_len + 1
         self.desc_slot_size = desc_len + 1
 
-        # Card stats
+        # Primary stats
         self.konami_id = konami_id
-        # Card ID = card name index or 0xFFFF
-        self.card_id_index = card_id_index
+        self.card_id_index = card_id_index  # card name index or 0xFFFF
         self.artwork_id = artwork_id
         self.edited_flag = edited_flag
         self.atk = atk
@@ -72,7 +70,22 @@ class CardEntry:
         self.attribute = attribute
         self.type_ = type_
         self.st_race = st_race
-        self.padding = padding  # normally not edited, but kept
+        self.padding = padding
+
+        # Secondary stats (filled later from second table)
+        self.second_stats_index = -1  # which row in the 2648-entry second table we came from
+        self.konami2 = 0
+        self.card_id_index2 = 0xFFFF  # card name index or 0xFFFF (default: none)
+        self.artwork2 = 0
+        self.edited_flag2 = 0
+        self.atk2 = 0
+        self.deff2 = 0
+        self.level2 = 0
+        self.race2 = 0
+        self.attribute2 = 0
+        self.type2 = 0
+        self.st_race2 = 0
+        self.padding2 = 0
 
 
 class RomEditorApp(tk.Tk):
@@ -81,25 +94,26 @@ class RomEditorApp(tk.Tk):
         self.title("Yu-Gi-Oh! UM 2006 – Card Editor")
 
         self.rom_path = None
-        self.rom_data = None  # bytearray
-        self.cards = []       # list[CardEntry]
-        self.current_index = None  # selected card index in self.cards
-        self.filtered_indices = []  # mapping listbox row -> card index
+        self.rom_data = None
+        self.cards = []
+        self.current_index = None
+        self.filtered_indices = []
 
-        # Optional text-based mappings for race/attribute/type/spell_trap_race
+        # Lookup text lists
         self.races_list = []
         self.attributes_list = []
         self.types_list = []
         self.st_races_list = []
 
-        # Card ID dropdown values (global list: index -> "0000: Name")
+        # Card ID dropdown choices ("0000: Name")
         self.card_id_choices = []
 
         # YGOPRODeck Konami ID -> name
         self.konami_name_map = {}
 
-        # flag to suppress Konami ID trace recursion
-        self._updating_konami = False
+        # Trace guards
+        self._updating_konami_main = False
+        self._updating_konami_sec = False
 
         self._load_text_mappings()
         self._load_json_mappings()
@@ -110,10 +124,6 @@ class RomEditorApp(tk.Tk):
     # =========================
 
     def _load_text_mappings(self):
-        """
-        Load ../text/races.txt, ../text/attributes.txt, ../text/types.txt,
-        ../text/spell_trap_races.txt relative to this script.
-        """
         try:
             base_dir = os.path.dirname(os.path.abspath(__file__))
         except Exception:
@@ -132,10 +142,6 @@ class RomEditorApp(tk.Tk):
         self.st_races_list = load_lines(os.path.join("..", "text", "spell_trap_races.txt"))
 
     def _load_json_mappings(self):
-        """
-        Load ../json/ygoprodeck_card_info.json and build mapping:
-        konami_id -> card name
-        """
         try:
             base_dir = os.path.dirname(os.path.abspath(__file__))
         except Exception:
@@ -166,7 +172,6 @@ class RomEditorApp(tk.Tk):
                         mapping[konami_id] = name
                 except Exception:
                     continue
-
         self.konami_name_map = mapping
 
     # =========================
@@ -184,15 +189,14 @@ class RomEditorApp(tk.Tk):
         menubar.add_cascade(label="File", menu=file_menu)
         self.config(menu=menubar)
 
-        # Main layout: left list, right editor
+        # Main layout
         main_frame = tk.Frame(self)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Left: card list + search
+        # Left: list + search
         left_frame = tk.Frame(main_frame)
         left_frame.pack(side=tk.LEFT, fill=tk.Y)
 
-        # Search box
         search_frame = tk.Frame(left_frame)
         search_frame.pack(fill=tk.X, pady=(0, 5))
 
@@ -201,21 +205,18 @@ class RomEditorApp(tk.Tk):
         search_entry = tk.Entry(search_frame, textvariable=self.search_var, width=20)
         search_entry.pack(side=tk.LEFT, padx=(3, 3))
         search_entry.bind("<Return>", lambda e: self.apply_filter())
-
         tk.Button(search_frame, text="Apply", command=self.apply_filter).pack(side=tk.LEFT)
         tk.Button(search_frame, text="Clear", command=self.clear_filter).pack(side=tk.LEFT, padx=(3, 0))
 
         tk.Label(left_frame, text="Cards").pack(anchor="w")
-
         self.card_listbox = tk.Listbox(left_frame, width=40)
         self.card_listbox.pack(side=tk.LEFT, fill=tk.Y, expand=False)
-
         scrollbar = tk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.card_listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.card_listbox.config(yscrollcommand=scrollbar.set)
         self.card_listbox.bind("<<ListboxSelect>>", self.on_card_selected)
 
-        # Right: editor pane
+        # Right: editor
         right_frame = tk.Frame(main_frame)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
@@ -237,90 +238,122 @@ class RomEditorApp(tk.Tk):
         self.desc_text = ScrolledText(desc_frame, height=8, wrap=tk.WORD)
         self.desc_text.pack(fill=tk.BOTH, expand=True)
 
-        # --- Card Stats section ---
-        stats_frame = tk.LabelFrame(right_frame, text="Card Stats")
-        stats_frame.pack(fill=tk.X, pady=(5, 0))
+        # Stats notebook
+        stats_notebook = ttk.Notebook(right_frame)
+        stats_notebook.pack(fill=tk.X, pady=(5, 0))
 
-        # Variables
-        self.konami_id_var = tk.IntVar()
-        self.card_id_var = tk.StringVar()
-        self.artwork_id_var = tk.IntVar()
-        self.edited_flag_var = tk.IntVar()
-        self.atk_var = tk.IntVar()
-        self.def_var = tk.IntVar()
-        self.level_var = tk.IntVar()
-        self.race_var = tk.IntVar()
-        self.attribute_var = tk.IntVar()
-        self.type_var = tk.IntVar()
-        self.st_race_var = tk.IntVar()
-        self.padding_var = tk.IntVar()
+        stats_main_frame = tk.Frame(stats_notebook)
+        stats_sec_frame = tk.Frame(stats_notebook)
+        stats_notebook.add(stats_main_frame, text="Main Stats")
+        stats_notebook.add(stats_sec_frame, text="Secondary Stats")
 
-        # Helper to build numeric Entry
-        def add_numeric_row(row, label, var, width=8):
-            tk.Label(stats_frame, text=label).grid(row=row, column=0, sticky="w", padx=2, pady=1)
-            entry = tk.Entry(stats_frame, textvariable=var, width=width)
+        # MAIN stats vars
+        self.konami_main_var = tk.IntVar()
+        self.card_id_main_var = tk.StringVar()
+        self.artwork_main_var = tk.IntVar()
+        self.edited_main_var = tk.IntVar()
+        self.atk_main_var = tk.IntVar()
+        self.def_main_var = tk.IntVar()
+        self.level_main_var = tk.IntVar()
+        self.race_main_var = tk.IntVar()
+        self.attribute_main_var = tk.IntVar()
+        self.type_main_var = tk.IntVar()
+        self.st_race_main_var = tk.IntVar()
+        self.padding_main_var = tk.IntVar()
+
+        # SECONDARY stats vars
+        self.konami_sec_var = tk.IntVar()
+        self.card_id_sec_var = tk.StringVar()
+        self.artwork_sec_var = tk.IntVar()
+        self.edited_sec_var = tk.IntVar()
+        self.atk_sec_var = tk.IntVar()
+        self.def_sec_var = tk.IntVar()
+        self.level_sec_var = tk.IntVar()
+        self.race_sec_var = tk.IntVar()
+        self.attribute_sec_var = tk.IntVar()
+        self.type_sec_var = tk.IntVar()
+        self.st_race_sec_var = tk.IntVar()
+        self.padding_sec_var = tk.IntVar()
+
+        def add_numeric_row(frame, row, label, var, width=8):
+            tk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=2, pady=1)
+            entry = tk.Entry(frame, textvariable=var, width=width)
             entry.grid(row=row, column=1, sticky="w", padx=2, pady=1)
             return entry
 
-        row = 0
-        # Konami ID first
-        self.konami_entry = add_numeric_row(row, "Konami ID:", self.konami_id_var); row += 1
-
-        # Card ID (dropdown)
-        tk.Label(stats_frame, text="Card ID (Name Index):").grid(row=row, column=0, sticky="w", padx=2, pady=1)
-        self.card_id_combo = ttk.Combobox(stats_frame, textvariable=self.card_id_var, state="readonly", width=30)
-        self.card_id_combo.grid(row=row, column=1, sticky="w", padx=2, pady=1)
-        row += 1
-
-        # Rest of stats
-        self.artwork_entry = add_numeric_row(row, "Artwork #:", self.artwork_id_var); row += 1
-        self.edited_entry = add_numeric_row(row, "Edited Art Flag:", self.edited_flag_var); row += 1
-        self.atk_entry = add_numeric_row(row, "ATK:", self.atk_var); row += 1
-        self.def_entry = add_numeric_row(row, "DEF:", self.def_var); row += 1
-        self.level_entry = add_numeric_row(row, "Level:", self.level_var); row += 1
-
-        # Helper to build Combobox with fallback
-        def add_combo_row(row, label, values_list, numeric_var):
-            tk.Label(stats_frame, text=label).grid(row=row, column=0, sticky="w", padx=2, pady=1)
-            frame = tk.Frame(stats_frame)
-            frame.grid(row=row, column=1, sticky="w", padx=2, pady=1)
-
+        def add_combo_row(frame, row, label, values_list, numeric_var):
+            tk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=2, pady=1)
+            container = tk.Frame(frame)
+            container.grid(row=row, column=1, sticky="w", padx=2, pady=1)
             combo = None
             if values_list:
-                combo = ttk.Combobox(frame, values=values_list, state="readonly", width=20)
+                combo = ttk.Combobox(container, values=values_list, state="readonly", width=20)
                 combo.pack(side=tk.LEFT)
             else:
-                entry = tk.Entry(frame, textvariable=numeric_var, width=8)
+                entry = tk.Entry(container, textvariable=numeric_var, width=8)
                 entry.pack(side=tk.LEFT)
-
             return combo
 
-        self.race_combo = add_combo_row(row, "Race:", self.races_list, self.race_var); row += 1
-        self.attribute_combo = add_combo_row(row, "Attribute:", self.attributes_list, self.attribute_var); row += 1
-        self.type_combo = add_combo_row(row, "Type:", self.types_list, self.type_var); row += 1
-        self.st_race_combo = add_combo_row(row, "Spell/Trap Race:", self.st_races_list, self.st_race_var); row += 1
-
-        # Padding (readonly-ish)
-        tk.Label(stats_frame, text="Padding (raw):").grid(row=row, column=0, sticky="w", padx=2, pady=1)
-        self.padding_entry = tk.Entry(stats_frame, textvariable=self.padding_var, width=8, state="disabled")
-        self.padding_entry.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+        # MAIN stats UI
+        row = 0
+        self.konami_main_entry = add_numeric_row(stats_main_frame, row, "Konami ID:", self.konami_main_var); row += 1
+        tk.Label(stats_main_frame, text="Card ID (Name Index):").grid(row=row, column=0, sticky="w", padx=2, pady=1)
+        self.card_id_main_combo = ttk.Combobox(stats_main_frame, textvariable=self.card_id_main_var,
+                                               state="readonly", width=30)
+        self.card_id_main_combo.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+        row += 1
+        self.artwork_main_entry = add_numeric_row(stats_main_frame, row, "Artwork #:", self.artwork_main_var); row += 1
+        self.edited_main_entry = add_numeric_row(stats_main_frame, row, "Edited Art Flag:", self.edited_main_var); row += 1
+        self.atk_main_entry = add_numeric_row(stats_main_frame, row, "ATK:", self.atk_main_var); row += 1
+        self.def_main_entry = add_numeric_row(stats_main_frame, row, "DEF:", self.def_main_var); row += 1
+        self.level_main_entry = add_numeric_row(stats_main_frame, row, "Level:", self.level_main_var); row += 1
+        self.race_main_combo = add_combo_row(stats_main_frame, row, "Race:", self.races_list, self.race_main_var); row += 1
+        self.attribute_main_combo = add_combo_row(stats_main_frame, row, "Attribute:", self.attributes_list, self.attribute_main_var); row += 1
+        self.type_main_combo = add_combo_row(stats_main_frame, row, "Type:", self.types_list, self.type_main_var); row += 1
+        self.st_race_main_combo = add_combo_row(stats_main_frame, row, "Spell/Trap Race:", self.st_races_list, self.st_race_main_var); row += 1
+        tk.Label(stats_main_frame, text="Padding (raw):").grid(row=row, column=0, sticky="w", padx=2, pady=1)
+        self.padding_main_entry = tk.Entry(stats_main_frame, textvariable=self.padding_main_var,
+                                           width=8, state="disabled")
+        self.padding_main_entry.grid(row=row, column=1, sticky="w", padx=2, pady=1)
         row += 1
 
-        # Navigation / update buttons
+        # SECONDARY stats UI
+        row = 0
+        self.konami_sec_entry = add_numeric_row(stats_sec_frame, row, "Konami ID:", self.konami_sec_var); row += 1
+        tk.Label(stats_sec_frame, text="Card ID (Name Index):").grid(row=row, column=0, sticky="w", padx=2, pady=1)
+        self.card_id_sec_combo = ttk.Combobox(stats_sec_frame, textvariable=self.card_id_sec_var,
+                                              state="readonly", width=30)
+        self.card_id_sec_combo.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+        row += 1
+        self.artwork_sec_entry = add_numeric_row(stats_sec_frame, row, "Artwork #:", self.artwork_sec_var); row += 1
+        self.edited_sec_entry = add_numeric_row(stats_sec_frame, row, "Edited Art Flag:", self.edited_sec_var); row += 1
+        self.atk_sec_entry = add_numeric_row(stats_sec_frame, row, "ATK:", self.atk_sec_var); row += 1
+        self.def_sec_entry = add_numeric_row(stats_sec_frame, row, "DEF:", self.def_sec_var); row += 1
+        self.level_sec_entry = add_numeric_row(stats_sec_frame, row, "Level:", self.level_sec_var); row += 1
+        self.race_sec_combo = add_combo_row(stats_sec_frame, row, "Race:", self.races_list, self.race_sec_var); row += 1
+        self.attribute_sec_combo = add_combo_row(stats_sec_frame, row, "Attribute:", self.attributes_list, self.attribute_sec_var); row += 1
+        self.type_sec_combo = add_combo_row(stats_sec_frame, row, "Type:", self.types_list, self.type_sec_var); row += 1
+        self.st_race_sec_combo = add_combo_row(stats_sec_frame, row, "Spell/Trap Race:", self.st_races_list, self.st_race_sec_var); row += 1
+        tk.Label(stats_sec_frame, text="Padding (raw):").grid(row=row, column=0, sticky="w", padx=2, pady=1)
+        self.padding_sec_entry = tk.Entry(stats_sec_frame, textvariable=self.padding_sec_var,
+                                          width=8, state="disabled")
+        self.padding_sec_entry.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+        row += 1
+
+        # Buttons
         button_frame = tk.Frame(right_frame)
         button_frame.pack(fill=tk.X, pady=5)
-
         self.prev_btn = tk.Button(button_frame, text="<< Previous", command=self.prev_card, state=tk.DISABLED)
         self.prev_btn.pack(side=tk.LEFT)
-
         self.next_btn = tk.Button(button_frame, text="Next >>", command=self.next_card, state=tk.DISABLED)
         self.next_btn.pack(side=tk.LEFT, padx=(5, 0))
-
-        self.apply_btn = tk.Button(button_frame, text="Apply Changes (in memory)", command=self.apply_changes, state=tk.DISABLED)
+        self.apply_btn = tk.Button(button_frame, text="Apply Changes (in memory)",
+                                   command=self.apply_changes, state=tk.DISABLED)
         self.apply_btn.pack(side=tk.RIGHT)
 
-        # Trace Konami ID to auto-update Card ID display (from card ID table + JSON if needed)
-        self.konami_id_var.trace_add("write", self._on_konami_id_changed)
+        # Traces
+        self.konami_main_var.trace_add("write", self._on_konami_main_changed)
+        self.konami_sec_var.trace_add("write", self._on_konami_sec_changed)
 
     # =========================
     # ROM HANDLING
@@ -333,7 +366,6 @@ class RomEditorApp(tk.Tk):
         )
         if not path:
             return
-
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -347,15 +379,14 @@ class RomEditorApp(tk.Tk):
         try:
             self.cards = self._parse_cards()
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to parse ROM structures:\n{e}")
+            messagebox.showerror("Error", f"Failed to parse ROM:\n{e}")
             self.rom_data = None
             self.cards = []
             return
 
         self._update_card_id_choices()
-
         self.current_index = 0
-        self.clear_filter()  # populates full list
+        self.clear_filter()
         self._load_card_into_editor(0)
         self._update_controls_state()
         self.info_label.config(text=f"Loaded ROM: {os.path.basename(self.rom_path)} ({NUM_CARDS} cards)")
@@ -398,19 +429,17 @@ class RomEditorApp(tk.Tk):
     def _read_c_string(self, data, addr):
         if addr < 0 or addr >= len(data):
             raise ValueError(f"String address {hex(addr)} out of range.")
-
         end_limit = min(TEXT_LIMIT, len(data))
-        bytes_out = []
+        out = []
         pos = addr
         while pos < end_limit:
             b = data[pos]
             if b == 0:
                 break
-            bytes_out.append(b)
+            out.append(b)
             pos += 1
-
-        s = bytes(bytes_out).decode("ascii", errors="replace")
-        return s, len(bytes_out)
+        s = bytes(out).decode("ascii", errors="replace")
+        return s, len(out)
 
     @staticmethod
     def _read_u16(data, offset):
@@ -437,25 +466,21 @@ class RomEditorApp(tk.Tk):
         cards = []
         data = self.rom_data
 
+        # First pass: names, descriptions, PRIMARY stats
         for i in range(NUM_CARDS):
-            # ----- NAME POINTER -----
             name_ptr_off = CARD_NAME_PTR_BASE + i * 4
             name_rel = int.from_bytes(data[name_ptr_off:name_ptr_off + 4], "little")
             name_addr = TEXT_BASE + name_rel
-
             name_str, name_len = self._read_c_string(data, name_addr)
 
-            # ----- DESCRIPTION POINTER -----
             desc_ptr_off = CARD_DESC_PTR_BASE + i * 4
             desc_rel = int.from_bytes(data[desc_ptr_off:desc_ptr_off + 4], "little")
             desc_addr = TEXT_BASE + desc_rel
-
             desc_str, desc_len = self._read_c_string(data, desc_addr)
 
-            # ----- STATS STRUCT -----
             stats_off = CARD_STATS_BASE + i * CARD_STATS_SIZE
             if stats_off + CARD_STATS_SIZE > len(data):
-                raise ValueError(f"Stats struct for card {i} goes beyond ROM size.")
+                raise ValueError(f"Primary stats for card {i} out of range.")
 
             konami_id = self._read_u16(data, stats_off + 0x0)
             artwork_id = self._read_u16(data, stats_off + 0x2)
@@ -469,7 +494,6 @@ class RomEditorApp(tk.Tk):
             st_race = self._read_u16(data, stats_off + 0x12)
             padding = self._read_u16(data, stats_off + 0x14)
 
-            # Card ID (card name index or 0xFFFF) from card ID table
             card_id_index = self._read_card_id_index_from_table(data, konami_id)
 
             card = CardEntry(
@@ -497,29 +521,72 @@ class RomEditorApp(tk.Tk):
             )
             cards.append(card)
 
+        # Second pass: SECONDARY stats (2648 entries)
+        # Map by second-table index -> card ID table slot -> card name index.
+        for sec_idx in range(SECOND_STATS_COUNT):
+            stats2_off = SECOND_CARD_STATS_BASE + sec_idx * SECOND_CARD_STATS_SIZE
+            if stats2_off + SECOND_CARD_STATS_SIZE > len(data):
+                break
+
+            konami2 = self._read_u16(data, stats2_off + 0x0)
+            artwork2 = self._read_u16(data, stats2_off + 0x2)
+            edited_flag2 = self._read_u16(data, stats2_off + 0x4)
+            atk2 = self._read_u16(data, stats2_off + 0x6)
+            deff2 = self._read_u16(data, stats2_off + 0x8)
+            level2 = self._read_u16(data, stats2_off + 0xA)
+            race2 = self._read_u16(data, stats2_off + 0xC)
+            attribute2 = self._read_u16(data, stats2_off + 0xE)
+            type2 = self._read_u16(data, stats2_off + 0x10)
+            st_race2 = self._read_u16(data, stats2_off + 0x12)
+            padding2 = self._read_u16(data, stats2_off + 0x14)
+
+            # Use second table index as "card ID index - 4007".
+            # So slot sec_idx in the card ID table gives us the card name index.
+            card_name_index = self._read_u16(data, CARD_ID_TABLE_BASE + sec_idx * 2)
+
+            if card_name_index == 0xFFFF:
+                # "None" slot – doesn't map to an internal card name index.
+                continue
+            if not (0 <= card_name_index < NUM_CARDS):
+                continue
+
+            card = cards[card_name_index]
+            # If multiple second entries would map to same card name index, keep the first.
+            if card.second_stats_index != -1:
+                continue
+
+            card.second_stats_index = sec_idx
+            card.konami2 = konami2
+            # Derive the display card ID index from Konami2 at parse-time,
+            # so the secondary Card ID label is correct immediately.
+            konami_based_idx = self._read_card_id_index_from_table(data, konami2)
+            card.card_id_index2 = konami_based_idx
+            card.artwork2 = artwork2
+            card.edited_flag2 = edited_flag2
+            card.atk2 = atk2
+            card.deff2 = deff2
+            card.level2 = level2
+            card.race2 = race2
+            card.attribute2 = attribute2
+            card.type2 = type2
+            card.st_race2 = st_race2
+            card.padding2 = padding2
+
+        # Any card without second_stats_index keeps card_id_index2 as 0xFFFF (None)
         return cards
 
     # =========================
-    # FREE SPACE SEARCH & WRITE
+    # FREE SPACE / WRITE
     # =========================
 
     def _find_free_space(self, rom_data, size):
-        """
-        Find a sequence of 'size' zero bytes between TEXT_BASE and TEXT_LIMIT.
-        Returns absolute address or None.
-
-        Uses run_start + 1 so we don't overwrite the very first 00 byte
-        of the run (your requested behavior).
-        """
         start = TEXT_BASE
         end = min(TEXT_LIMIT, len(rom_data))
-
         if size <= 0:
             return None
 
         run_start = None
         run_length = 0
-
         for addr in range(start, end):
             if rom_data[addr] == 0:
                 if run_start is None:
@@ -527,23 +594,15 @@ class RomEditorApp(tk.Tk):
                     run_length = 1
                 else:
                     run_length += 1
-
                 if run_length >= size:
+                    # Place the pointer at run_start + 1 per your request
                     return run_start + 1
             else:
                 run_start = None
                 run_length = 0
-
         return None
 
     def _write_string_and_update_pointer(self, rom_data, card, is_name):
-        """
-        Write card.name or card.desc into ROM.
-        - If fits current slot (slot_size), write in-place.
-        - Otherwise, find free zero space, write there, update relative pointer,
-          and zero out the original slot.
-        - Always writes a 00 terminator after the text.
-        """
         if is_name:
             text = card.name
             orig_addr = card.name_addr
@@ -556,7 +615,7 @@ class RomEditorApp(tk.Tk):
             ptr_off = card.desc_ptr_off
 
         encoded = text.encode("ascii", errors="replace")
-        needed = len(encoded) + 1  # include 00 terminator
+        needed = len(encoded) + 1  # include 0 terminator
 
         if needed <= slot_size and 0 <= orig_addr < len(rom_data):
             write_addr = orig_addr
@@ -567,17 +626,16 @@ class RomEditorApp(tk.Tk):
                     f"Not enough free space for {'name' if is_name else 'description'} "
                     f"of card {card.index} (need {needed} bytes)."
                 )
-
-            # Zero out the new block
+            # Zero-out the new block
             for i in range(write_addr, write_addr + needed):
                 if i < len(rom_data):
                     rom_data[i] = 0
-
-            # Zero out old slot
+            # Zero-out the old slot
             if 0 <= orig_addr < len(rom_data):
-                for offset in range(orig_addr, min(orig_addr + slot_size, len(rom_data))):
-                    rom_data[offset] = 0
+                for o in range(orig_addr, min(orig_addr + slot_size, len(rom_data))):
+                    rom_data[o] = 0
 
+            # Update card slot info & pointer
             if is_name:
                 card.name_addr = write_addr
                 card.name_slot_size = needed
@@ -591,7 +649,7 @@ class RomEditorApp(tk.Tk):
             rom_data[ptr_off:ptr_off + 4] = rel.to_bytes(4, "little")
 
         if write_addr < 0 or write_addr + needed > len(rom_data):
-            raise RuntimeError("Write address out of file bounds.")
+            raise RuntimeError("Write address out of bounds.")
 
         rom_data[write_addr:write_addr + len(encoded)] = encoded
         if write_addr + len(encoded) < len(rom_data):
@@ -599,78 +657,90 @@ class RomEditorApp(tk.Tk):
         else:
             raise RuntimeError("No space to write terminator byte.")
 
+        # Clean remaining bytes in slot if shorter
         if write_addr == orig_addr and needed < slot_size:
-            for offset in range(write_addr + needed, write_addr + slot_size):
-                if offset < len(rom_data):
-                    rom_data[offset] = 0
+            for o in range(write_addr + needed, write_addr + slot_size):
+                if o < len(rom_data):
+                    rom_data[o] = 0
 
-    def _write_stats(self, rom_data, card):
-        stats_off = CARD_STATS_BASE + card.index * CARD_STATS_SIZE
-        if stats_off + CARD_STATS_SIZE > len(rom_data):
-            raise RuntimeError(f"Stats struct for card {card.index} goes beyond ROM size.")
+    def _write_stats_primary(self, rom_data, card):
+        off = CARD_STATS_BASE + card.index * CARD_STATS_SIZE
+        if off + CARD_STATS_SIZE > len(rom_data):
+            raise RuntimeError(f"Primary stats for card {card.index} out of range.")
+        self._write_u16(rom_data, off + 0x0, card.konami_id)
+        self._write_u16(rom_data, off + 0x2, card.artwork_id)
+        self._write_u16(rom_data, off + 0x4, card.edited_flag)
+        self._write_u16(rom_data, off + 0x6, card.atk)
+        self._write_u16(rom_data, off + 0x8, card.deff)
+        self._write_u16(rom_data, off + 0xA, card.level)
+        self._write_u16(rom_data, off + 0xC, card.race)
+        self._write_u16(rom_data, off + 0xE, card.attribute)
+        self._write_u16(rom_data, off + 0x10, card.type_)
+        self._write_u16(rom_data, off + 0x12, card.st_race)
+        self._write_u16(rom_data, off + 0x14, card.padding)
 
-        self._write_u16(rom_data, stats_off + 0x0, card.konami_id)
-        self._write_u16(rom_data, stats_off + 0x2, card.artwork_id)
-        self._write_u16(rom_data, stats_off + 0x4, card.edited_flag)
-        self._write_u16(rom_data, stats_off + 0x6, card.atk)
-        self._write_u16(rom_data, stats_off + 0x8, card.deff)
-        self._write_u16(rom_data, stats_off + 0xA, card.level)
-        self._write_u16(rom_data, stats_off + 0xC, card.race)
-        self._write_u16(rom_data, stats_off + 0xE, card.attribute)
-        self._write_u16(rom_data, stats_off + 0x10, card.type_)
-        self._write_u16(rom_data, stats_off + 0x12, card.st_race)
-        self._write_u16(rom_data, stats_off + 0x14, card.padding)
-
-    def _write_card_id_table_entry(self, rom_data, card):
-        """
-        Write card.card_id_index (card name index OR 0xFFFF)
-        into the card ID table for card.konami_id.
-        """
-        konami = card.konami_id
-        if konami < KONAMI_ID_BASE:
+    def _write_stats_secondary(self, rom_data, card):
+        if card.second_stats_index < 0:
             return
-        pos = konami - KONAMI_ID_BASE
+        off = SECOND_CARD_STATS_BASE + card.second_stats_index * SECOND_CARD_STATS_SIZE
+        if off + SECOND_CARD_STATS_SIZE > len(rom_data):
+            return
+        self._write_u16(rom_data, off + 0x0, card.konami2)
+        self._write_u16(rom_data, off + 0x2, card.artwork2)
+        self._write_u16(rom_data, off + 0x4, card.edited_flag2)
+        self._write_u16(rom_data, off + 0x6, card.atk2)
+        self._write_u16(rom_data, off + 0x8, card.deff2)
+        self._write_u16(rom_data, off + 0xA, card.level2)
+        self._write_u16(rom_data, off + 0xC, card.race2)
+        self._write_u16(rom_data, off + 0xE, card.attribute2)
+        self._write_u16(rom_data, off + 0x10, card.type2)
+        self._write_u16(rom_data, off + 0x12, card.st_race2)
+        self._write_u16(rom_data, off + 0x14, card.padding2)
+
+    def _write_card_id_entry(self, rom_data, konami_id, card_id_index):
+        """
+        Write primary mapping: Konami ID -> card name index (card_id_index)
+        into the card ID table.
+        """
+        if konami_id < KONAMI_ID_BASE:
+            return
+        pos = konami_id - KONAMI_ID_BASE
         offset = CARD_ID_TABLE_BASE + pos * 2
         if offset + 2 > len(rom_data):
             return
-        self._write_u16(rom_data, offset, card.card_id_index)
+        self._write_u16(rom_data, offset, card_id_index)
 
     def _apply_all_changes_to_rom(self, rom_copy):
         for card in self.cards:
             self._write_string_and_update_pointer(rom_copy, card, is_name=True)
             self._write_string_and_update_pointer(rom_copy, card, is_name=False)
-            self._write_stats(rom_copy, card)
-            self._write_card_id_table_entry(rom_copy, card)
+            self._write_stats_primary(rom_copy, card)
+            self._write_stats_secondary(rom_copy, card)
+            # Only primary stats update the card ID table, to avoid
+            # fighting with the secondary-table index-based mapping.
+            self._write_card_id_entry(rom_copy, card.konami_id, card.card_id_index)
 
     # =========================
-    # CARD ID UI HELPERS
+    # CARD ID UI
     # =========================
 
     def _card_id_display_for_index(self, idx):
-        """
-        For a normal internal mapping: card name index -> "0005: Name"
-        """
         if 0 <= idx < len(self.cards):
             name = self.cards[idx].name.replace("\n", " ")
             if len(name) > 30:
                 name = name[:30] + "..."
             return f"{idx:04d}: {name}"
-        else:
-            return f"{idx:04d}"
+        return f"{idx:04d}"
 
     def _update_card_id_choices(self):
-        """
-        Populate the card ID dropdown base choices from internal card names.
-        (used for all cards; special '(None)' display is per card via _set_card_id_ui_from_index)
-        """
         self.card_id_choices = [self._card_id_display_for_index(i) for i in range(len(self.cards))]
-        self.card_id_combo["values"] = self.card_id_choices
+        self.card_id_main_combo["values"] = self.card_id_choices
+        self.card_id_sec_combo["values"] = self.card_id_choices
 
-    def _set_card_id_ui_from_index(self, index_val, konami_id=None):
+    def _set_card_id_ui(self, var_obj, index_val, konami_id=None):
         """
-        Set combobox display for a given card's Card ID value.
-        - If index_val == 0xFFFF, use YGOPRODeck name (None).
-        - Otherwise use internal "index: name" display.
+        index_val == 0xFFFF -> use YGOPRODeck (None) style label.
+        Otherwise -> "nnnn: Name".
         """
         if index_val == 0xFFFF:
             if konami_id is not None and konami_id in self.konami_name_map:
@@ -680,18 +750,13 @@ class RomEditorApp(tk.Tk):
                 label = f"Konami {konami_id} (None)"
             else:
                 label = "None"
-            self.card_id_var.set(label)
+            var_obj.set(label)
         else:
-            display = self._card_id_display_for_index(index_val)
-            self.card_id_var.set(display)
+            var_obj.set(self._card_id_display_for_index(index_val))
 
-    def _get_card_id_index_from_ui(self):
-        """
-        Parse card_id_index from combobox:
-        - If text ends with '(None)', treat as 0xFFFF
-        - Else parse leading integer before ':' as the card name index
-        """
-        val = self.card_id_var.get()
+    @staticmethod
+    def _get_card_id_index_from_ui(var_obj):
+        val = var_obj.get()
         if not val:
             return 0
         if val.endswith("(None)"):
@@ -703,26 +768,23 @@ class RomEditorApp(tk.Tk):
             return 0
 
     # =========================
-    # UI – CARD LIST & EDITOR
+    # LIST & EDITOR UI
     # =========================
 
     def _populate_card_list(self, filter_text=""):
         filter_text = filter_text.lower()
         self.card_listbox.delete(0, tk.END)
         self.filtered_indices = []
-
         for i, card in enumerate(self.cards):
             if filter_text and filter_text not in card.name.lower():
                 continue
             self.filtered_indices.append(i)
-
-        for card_index in self.filtered_indices:
-            card = self.cards[card_index]
-            display_name = card.name.replace("\n", " ")
-            if len(display_name) > 30:
-                display_name = display_name[:30] + "..."
-            self.card_listbox.insert(tk.END, f"{card.index:04d}: {display_name}")
-
+        for idx in self.filtered_indices:
+            card = self.cards[idx]
+            display = card.name.replace("\n", " ")
+            if len(display) > 30:
+                display = display[:30] + "..."
+            self.card_listbox.insert(tk.END, f"{card.index:04d}: {display}")
         if self.current_index is not None and self.current_index in self.filtered_indices:
             row = self.filtered_indices.index(self.current_index)
             self.card_listbox.selection_set(row)
@@ -731,7 +793,6 @@ class RomEditorApp(tk.Tk):
     def _load_card_into_editor(self, index):
         if not (0 <= index < len(self.cards)):
             return
-
         card = self.cards[index]
         self.current_index = index
 
@@ -745,36 +806,56 @@ class RomEditorApp(tk.Tk):
         self.desc_text.delete("1.0", tk.END)
         self.desc_text.insert("1.0", card.desc)
 
-        # Stats
-        self._updating_konami = True
-        self.konami_id_var.set(card.konami_id)
-        self._updating_konami = False
+        # MAIN
+        self._updating_konami_main = True
+        self.konami_main_var.set(card.konami_id)
+        self._updating_konami_main = False
+        self._set_card_id_ui(self.card_id_main_var, card.card_id_index, card.konami_id)
+        self.artwork_main_var.set(card.artwork_id)
+        self.edited_main_var.set(card.edited_flag)
+        self.atk_main_var.set(card.atk)
+        self.def_main_var.set(card.deff)
+        self.level_main_var.set(card.level)
+        self.race_main_var.set(card.race)
+        self.attribute_main_var.set(card.attribute)
+        self.type_main_var.set(card.type_)
+        self.st_race_main_var.set(card.st_race)
+        self.padding_main_var.set(card.padding)
 
-        self._set_card_id_ui_from_index(card.card_id_index, card.konami_id)
-
-        self.artwork_id_var.set(card.artwork_id)
-        self.edited_flag_var.set(card.edited_flag)
-        self.atk_var.set(card.atk)
-        self.def_var.set(card.deff)
-        self.level_var.set(card.level)
-        self.race_var.set(card.race)
-        self.attribute_var.set(card.attribute)
-        self.type_var.set(card.type_)
-        self.st_race_var.set(card.st_race)
-        self.padding_var.set(card.padding)
-
-        def set_combo_from_index(combo, index_val, values_list):
+        def set_combo(combo, index_val, values_list, var_obj):
             if combo is None:
+                var_obj.set(index_val)
                 return
             if 0 <= index_val < len(values_list):
                 combo.current(index_val)
             else:
                 combo.set(str(index_val))
 
-        set_combo_from_index(self.race_combo, card.race, self.races_list)
-        set_combo_from_index(self.attribute_combo, card.attribute, self.attributes_list)
-        set_combo_from_index(self.type_combo, card.type_, self.types_list)
-        set_combo_from_index(self.st_race_combo, card.st_race, self.st_races_list)
+        set_combo(self.race_main_combo, card.race, self.races_list, self.race_main_var)
+        set_combo(self.attribute_main_combo, card.attribute, self.attributes_list, self.attribute_main_var)
+        set_combo(self.type_main_combo, card.type_, self.types_list, self.type_main_var)
+        set_combo(self.st_race_main_combo, card.st_race, self.st_races_list, self.st_race_main_var)
+
+        # SECONDARY
+        self._updating_konami_sec = True
+        self.konami_sec_var.set(card.konami2)
+        self._updating_konami_sec = False
+        self._set_card_id_ui(self.card_id_sec_var, card.card_id_index2, card.konami2)
+        self.artwork_sec_var.set(card.artwork2)
+        self.edited_sec_var.set(card.edited_flag2)
+        self.atk_sec_var.set(card.atk2)
+        self.def_sec_var.set(card.deff2)
+        self.level_sec_var.set(card.level2)
+        self.race_sec_var.set(card.race2)
+        self.attribute_sec_var.set(card.attribute2)
+        self.type_sec_var.set(card.type2)
+        self.st_race_sec_var.set(card.st_race2)
+        self.padding_sec_var.set(card.padding2)
+
+        set_combo(self.race_sec_combo, card.race2, self.races_list, self.race_sec_var)
+        set_combo(self.attribute_sec_combo, card.attribute2, self.attributes_list, self.attribute_sec_var)
+        set_combo(self.type_sec_combo, card.type2, self.types_list, self.type_sec_var)
+        set_combo(self.st_race_sec_combo, card.st_race2, self.st_races_list, self.st_race_sec_var)
 
         # Listbox selection
         if self.filtered_indices:
@@ -800,23 +881,17 @@ class RomEditorApp(tk.Tk):
         if not sel:
             return
         row = sel[0]
-        card_index = self.filtered_indices[row]
-        self._load_card_into_editor(card_index)
+        idx = self.filtered_indices[row]
+        self._load_card_into_editor(idx)
 
     def apply_changes(self):
-        """
-        Save UI → current CardEntry (in memory only).
-        Also refresh Card ID choices so they track renamed cards.
-        """
         if self.current_index is None or not self.cards:
             return
         card = self.cards[self.current_index]
 
-        # Text
         card.name = self.name_var.get()
         card.desc = self.desc_text.get("1.0", tk.END).rstrip("\n")
 
-        # Stats
         def get_index_from_combo(combo, values_list, numeric_var):
             if combo is None:
                 return numeric_var.get()
@@ -833,21 +908,36 @@ class RomEditorApp(tk.Tk):
             except ValueError:
                 return numeric_var.get()
 
-        card.konami_id = self.konami_id_var.get()
-        card.card_id_index = self._get_card_id_index_from_ui()
-        card.artwork_id = self.artwork_id_var.get()
-        card.edited_flag = self.edited_flag_var.get()
-        card.atk = self.atk_var.get()
-        card.deff = self.def_var.get()
-        card.level = self.level_var.get()
-        card.race = get_index_from_combo(self.race_combo, self.races_list, self.race_var)
-        card.attribute = get_index_from_combo(self.attribute_combo, self.attributes_list, self.attribute_var)
-        card.type_ = get_index_from_combo(self.type_combo, self.types_list, self.type_var)
-        card.st_race = get_index_from_combo(self.st_race_combo, self.st_races_list, self.st_race_var)
+        # MAIN
+        card.konami_id = self.konami_main_var.get()
+        card.card_id_index = self._get_card_id_index_from_ui(self.card_id_main_var)
+        card.artwork_id = self.artwork_main_var.get()
+        card.edited_flag = self.edited_main_var.get()
+        card.atk = self.atk_main_var.get()
+        card.deff = self.def_main_var.get()
+        card.level = self.level_main_var.get()
+        card.race = get_index_from_combo(self.race_main_combo, self.races_list, self.race_main_var)
+        card.attribute = get_index_from_combo(self.attribute_main_combo, self.attributes_list, self.attribute_main_var)
+        card.type_ = get_index_from_combo(self.type_main_combo, self.types_list, self.type_main_var)
+        card.st_race = get_index_from_combo(self.st_race_main_combo, self.st_races_list, self.st_race_main_var)
 
-        # Refresh Card ID dropdown labels to reflect any renamed cards
+        # SECONDARY
+        card.konami2 = self.konami_sec_var.get()
+        card.card_id_index2 = self._get_card_id_index_from_ui(self.card_id_sec_var)
+        card.artwork2 = self.artwork_sec_var.get()
+        card.edited_flag2 = self.edited_sec_var.get()
+        card.atk2 = self.atk_sec_var.get()
+        card.deff2 = self.def_sec_var.get()
+        card.level2 = self.level_sec_var.get()
+        card.race2 = get_index_from_combo(self.race_sec_combo, self.races_list, self.race_sec_var)
+        card.attribute2 = get_index_from_combo(self.attribute_sec_combo, self.attributes_list, self.attribute_sec_var)
+        card.type2 = get_index_from_combo(self.type_sec_combo, self.types_list, self.type_sec_var)
+        card.st_race2 = get_index_from_combo(self.st_race_sec_combo, self.st_races_list, self.st_race_sec_var)
+
+        # Refresh dropdown labels after renames
         self._update_card_id_choices()
-        self._set_card_id_ui_from_index(card.card_id_index, card.konami_id)
+        self._set_card_id_ui(self.card_id_main_var, card.card_id_index, card.konami_id)
+        self._set_card_id_ui(self.card_id_sec_var, card.card_id_index2, card.konami2)
 
     def prev_card(self):
         if self.current_index is None:
@@ -876,7 +966,7 @@ class RomEditorApp(tk.Tk):
             self.desc_text.config(state=tk.NORMAL)
 
     # =========================
-    # SEARCH FILTER ACTIONS
+    # SEARCH & KONAMI TRACES
     # =========================
 
     def apply_filter(self):
@@ -887,33 +977,57 @@ class RomEditorApp(tk.Tk):
         self.search_var.set("")
         self._populate_card_list("")
 
-    # =========================
-    # KONAMI ID CHANGE HANDLER
-    # =========================
-
-    def _on_konami_id_changed(self, *args):
-        """
-        When Konami ID is changed in the UI, automatically update Card ID
-        from the ROM card ID table (and YGOPRODeck if value == 0xFFFF).
-        """
-        if self._updating_konami:
+    def _on_konami_main_changed(self, *args):
+        if self._updating_konami_main:
             return
-        if self.rom_data is None:
+        if self.rom_data is None or self.current_index is None or not self.cards:
             return
-        if self.current_index is None or not self.cards:
-            return
-
         try:
-            konami = self.konami_id_var.get()
+            konami = self.konami_main_var.get()
         except tk.TclError:
             return
-
         card_id_index = self._read_card_id_index_from_table(self.rom_data, konami)
-        self._set_card_id_ui_from_index(card_id_index, konami)
-
+        self._set_card_id_ui(self.card_id_main_var, card_id_index, konami)
         card = self.cards[self.current_index]
         card.konami_id = konami
         card.card_id_index = card_id_index
+
+    def _on_konami_sec_changed(self, *args):
+        """
+        For secondary stats, the 'Card ID (Name Index)' display should always be
+        derived from the *current* Konami ID in the secondary stats, using the
+        card ID table:
+            - If entry != 0xFFFF: it's a normal card name index.
+            - If entry == 0xFFFF: show YGOPRODeck name + ' (None)'.
+        This does NOT change which secondary stats row is attached to the card
+        (that's controlled by second_stats_index).
+        """
+        if self._updating_konami_sec:
+            return
+        if self.rom_data is None or self.current_index is None or not self.cards:
+            return
+
+        try:
+            konami2 = self.konami_sec_var.get()
+        except tk.TclError:
+            return
+        
+
+        card = self.cards[self.current_index]
+        card.konami2 = konami2
+
+        # Recompute the card-name index from the card ID table using Konami2
+        if konami2 >= KONAMI_ID_BASE:
+            idx_val = self._read_card_id_index_from_table(self.rom_data, konami2)
+        else:
+            idx_val = 0
+
+        # Store it (used only for display / saving, not for mapping the row)
+        card.card_id_index2 = idx_val
+
+        # Update the UI label; if idx_val == 0xFFFF, this will show 'Name (None)'
+        # using the YGOPRODeck mapping.
+        self._set_card_id_ui(self.card_id_sec_var, idx_val, konami2)
 
 
 if __name__ == "__main__":
