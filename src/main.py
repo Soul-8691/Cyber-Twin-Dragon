@@ -3,6 +3,7 @@ from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 from tkinter import ttk
 import os
+import json
 
 # =========================
 # CONSTANTS FOR THIS ROM
@@ -20,7 +21,7 @@ TEXT_LIMIT = 0x162248A  # exclusive upper bound for searching free space
 CARD_STATS_BASE = 0x18169B8
 CARD_STATS_SIZE = 0x16  # 0x16 bytes per card
 
-# Card ID table (Konami ID -> card index)
+# Card ID table (Konami ID -> card name index or 0xFFFF)
 CARD_ID_TABLE_BASE = 0x15B7CCC
 KONAMI_ID_BASE = 4007  # Konami ID offset
 
@@ -60,7 +61,7 @@ class CardEntry:
 
         # Card stats
         self.konami_id = konami_id
-        # Card ID = index into card names list (from card ID table)
+        # Card ID = card name index or 0xFFFF
         self.card_id_index = card_id_index
         self.artwork_id = artwork_id
         self.edited_flag = edited_flag
@@ -91,17 +92,21 @@ class RomEditorApp(tk.Tk):
         self.types_list = []
         self.st_races_list = []
 
-        # Card ID dropdown values (index + name)
+        # Card ID dropdown values (global list: index -> "0000: Name")
         self.card_id_choices = []
+
+        # YGOPRODeck Konami ID -> name
+        self.konami_name_map = {}
 
         # flag to suppress Konami ID trace recursion
         self._updating_konami = False
 
         self._load_text_mappings()
+        self._load_json_mappings()
         self._build_ui()
 
     # =========================
-    # LOAD TEXT MAPPINGS
+    # LOAD TEXT / JSON MAPPINGS
     # =========================
 
     def _load_text_mappings(self):
@@ -125,6 +130,44 @@ class RomEditorApp(tk.Tk):
         self.attributes_list = load_lines(os.path.join("..", "text", "attributes.txt"))
         self.types_list = load_lines(os.path.join("..", "text", "types.txt"))
         self.st_races_list = load_lines(os.path.join("..", "text", "spell_trap_races.txt"))
+
+    def _load_json_mappings(self):
+        """
+        Load ../json/ygoprodeck_card_info.json and build mapping:
+        konami_id -> card name
+        """
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base_dir = os.getcwd()
+
+        json_path = os.path.join(base_dir, "..", "json", "ygoprodeck_card_info.json")
+        if not os.path.isfile(json_path):
+            self.konami_name_map = {}
+            return
+
+        try:
+            with open(json_path, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+        except Exception:
+            self.konami_name_map = {}
+            return
+
+        mapping = {}
+        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+            for card_info in data["data"]:
+                try:
+                    misc = card_info.get("misc_info")
+                    if not misc or not isinstance(misc, list):
+                        continue
+                    konami_id = misc[0].get("konami_id")
+                    name = card_info.get("name")
+                    if isinstance(konami_id, int) and isinstance(name, str):
+                        mapping[konami_id] = name
+                except Exception:
+                    continue
+
+        self.konami_name_map = mapping
 
     # =========================
     # UI SETUP
@@ -247,7 +290,6 @@ class RomEditorApp(tk.Tk):
                 combo = ttk.Combobox(frame, values=values_list, state="readonly", width=20)
                 combo.pack(side=tk.LEFT)
             else:
-                # Fallback numeric entry only
                 entry = tk.Entry(frame, textvariable=numeric_var, width=8)
                 entry.pack(side=tk.LEFT)
 
@@ -277,7 +319,7 @@ class RomEditorApp(tk.Tk):
         self.apply_btn = tk.Button(button_frame, text="Apply Changes (in memory)", command=self.apply_changes, state=tk.DISABLED)
         self.apply_btn.pack(side=tk.RIGHT)
 
-        # Trace Konami ID to auto-update Card ID
+        # Trace Konami ID to auto-update Card ID display (from card ID table + JSON if needed)
         self.konami_id_var.trace_add("write", self._on_konami_id_changed)
 
     # =========================
@@ -299,7 +341,6 @@ class RomEditorApp(tk.Tk):
             messagebox.showerror("Error", f"Failed to open ROM:\n{e}")
             return
 
-        # Make mutable
         self.rom_data = bytearray(data)
         self.rom_path = path
 
@@ -324,7 +365,6 @@ class RomEditorApp(tk.Tk):
             messagebox.showinfo("No ROM", "Load a ROM first.")
             return
 
-        # ensure current card edits are stored into self.cards
         self.apply_changes()
 
         save_path = filedialog.asksaveasfilename(
@@ -336,7 +376,6 @@ class RomEditorApp(tk.Tk):
             return
 
         try:
-            # Work on a copy so we don't corrupt the in-memory original if something goes wrong mid-way
             rom_copy = bytearray(self.rom_data)
             self._apply_all_changes_to_rom(rom_copy)
         except Exception as e:
@@ -357,10 +396,6 @@ class RomEditorApp(tk.Tk):
     # =========================
 
     def _read_c_string(self, data, addr):
-        """
-        Read ASCII string from data starting at absolute address 'addr' until 0x00
-        or until TEXT_LIMIT. Returns (string, length_without_terminator).
-        """
         if addr < 0 or addr >= len(data):
             raise ValueError(f"String address {hex(addr)} out of range.")
 
@@ -387,7 +422,8 @@ class RomEditorApp(tk.Tk):
 
     def _read_card_id_index_from_table(self, data, konami_id):
         """
-        From Konami ID, read the card ID (card name index) from card ID table.
+        From Konami ID, read the card ID value (card name index or 0xFFFF)
+        from card ID table.
         """
         if konami_id < KONAMI_ID_BASE:
             return 0
@@ -433,7 +469,7 @@ class RomEditorApp(tk.Tk):
             st_race = self._read_u16(data, stats_off + 0x12)
             padding = self._read_u16(data, stats_off + 0x14)
 
-            # Card ID (card name index) from card ID table
+            # Card ID (card name index or 0xFFFF) from card ID table
             card_id_index = self._read_card_id_index_from_table(data, konami_id)
 
             card = CardEntry(
@@ -471,7 +507,8 @@ class RomEditorApp(tk.Tk):
         """
         Find a sequence of 'size' zero bytes between TEXT_BASE and TEXT_LIMIT.
         Returns absolute address or None.
-        NOTE: Using run_start + 1 so we don't overwrite the very first 00 byte
+
+        Uses run_start + 1 so we don't overwrite the very first 00 byte
         of the run (your requested behavior).
         """
         start = TEXT_BASE
@@ -521,12 +558,9 @@ class RomEditorApp(tk.Tk):
         encoded = text.encode("ascii", errors="replace")
         needed = len(encoded) + 1  # include 00 terminator
 
-        # Decide where to put it
         if needed <= slot_size and 0 <= orig_addr < len(rom_data):
-            # In-place
             write_addr = orig_addr
         else:
-            # Need new space
             write_addr = self._find_free_space(rom_data, needed)
             if write_addr is None:
                 raise RuntimeError(
@@ -534,17 +568,16 @@ class RomEditorApp(tk.Tk):
                     f"of card {card.index} (need {needed} bytes)."
                 )
 
-            # Zero out the allocated block fully before writing
+            # Zero out the new block
             for i in range(write_addr, write_addr + needed):
                 if i < len(rom_data):
                     rom_data[i] = 0
 
-            # Zero out the old slot (replace original text with 00 bytes)
+            # Zero out old slot
             if 0 <= orig_addr < len(rom_data):
                 for offset in range(orig_addr, min(orig_addr + slot_size, len(rom_data))):
                     rom_data[offset] = 0
 
-            # Update card's address and slot size in memory, and pointer in ROM
             if is_name:
                 card.name_addr = write_addr
                 card.name_slot_size = needed
@@ -555,31 +588,23 @@ class RomEditorApp(tk.Tk):
             rel = write_addr - TEXT_BASE
             if rel < 0 or rel > 0xFFFFFFFF:
                 raise RuntimeError("Relative pointer out of 32-bit range.")
-
             rom_data[ptr_off:ptr_off + 4] = rel.to_bytes(4, "little")
 
-        # Actually write the new string
         if write_addr < 0 or write_addr + needed > len(rom_data):
             raise RuntimeError("Write address out of file bounds.")
 
         rom_data[write_addr:write_addr + len(encoded)] = encoded
-        # Always ensure terminator is written
         if write_addr + len(encoded) < len(rom_data):
             rom_data[write_addr + len(encoded)] = 0
         else:
             raise RuntimeError("No space to write terminator byte.")
 
-        # If we're writing in the original slot and the new string is shorter
-        # than the slot, pad remaining slot with zeros to keep things clean.
         if write_addr == orig_addr and needed < slot_size:
             for offset in range(write_addr + needed, write_addr + slot_size):
                 if offset < len(rom_data):
                     rom_data[offset] = 0
 
     def _write_stats(self, rom_data, card):
-        """
-        Write the card's stats back into the ROM at the correct struct location.
-        """
         stats_off = CARD_STATS_BASE + card.index * CARD_STATS_SIZE
         if stats_off + CARD_STATS_SIZE > len(rom_data):
             raise RuntimeError(f"Stats struct for card {card.index} goes beyond ROM size.")
@@ -598,8 +623,8 @@ class RomEditorApp(tk.Tk):
 
     def _write_card_id_table_entry(self, rom_data, card):
         """
-        Write card.card_id_index into the card ID table for card.konami_id.
-        position = (KonamiID - 4007) * 2 bytes from CARD_ID_TABLE_BASE.
+        Write card.card_id_index (card name index OR 0xFFFF)
+        into the card ID table for card.konami_id.
         """
         konami = card.konami_id
         if konami < KONAMI_ID_BASE:
@@ -607,14 +632,10 @@ class RomEditorApp(tk.Tk):
         pos = konami - KONAMI_ID_BASE
         offset = CARD_ID_TABLE_BASE + pos * 2
         if offset + 2 > len(rom_data):
-            # out of ROM range; silently skip
             return
         self._write_u16(rom_data, offset, card.card_id_index)
 
     def _apply_all_changes_to_rom(self, rom_copy):
-        """
-        Apply all cards' name/desc changes, stats, and card ID mapping to rom_copy.
-        """
         for card in self.cards:
             self._write_string_and_update_pointer(rom_copy, card, is_name=True)
             self._write_string_and_update_pointer(rom_copy, card, is_name=False)
@@ -627,37 +648,54 @@ class RomEditorApp(tk.Tk):
 
     def _card_id_display_for_index(self, idx):
         """
-        Build display string like '0005: Some Card Name'.
+        For a normal internal mapping: card name index -> "0005: Name"
         """
-        if not (0 <= idx < len(self.cards)):
+        if 0 <= idx < len(self.cards):
+            name = self.cards[idx].name.replace("\n", " ")
+            if len(name) > 30:
+                name = name[:30] + "..."
+            return f"{idx:04d}: {name}"
+        else:
             return f"{idx:04d}"
-        name = self.cards[idx].name.replace("\n", " ")
-        if len(name) > 30:
-            name = name[:30] + "..."
-        return f"{idx:04d}: {name}"
 
     def _update_card_id_choices(self):
         """
-        Populate the card ID dropdown with 'index: name' for all cards.
+        Populate the card ID dropdown base choices from internal card names.
+        (used for all cards; special '(None)' display is per card via _set_card_id_ui_from_index)
         """
         self.card_id_choices = [self._card_id_display_for_index(i) for i in range(len(self.cards))]
         self.card_id_combo["values"] = self.card_id_choices
 
-    def _set_card_id_ui_from_index(self, index_val):
+    def _set_card_id_ui_from_index(self, index_val, konami_id=None):
         """
-        Set the Card ID combobox display from an integer index.
+        Set combobox display for a given card's Card ID value.
+        - If index_val == 0xFFFF, use YGOPRODeck name (None).
+        - Otherwise use internal "index: name" display.
         """
-        display = self._card_id_display_for_index(index_val)
-        self.card_id_var.set(display)
+        if index_val == 0xFFFF:
+            if konami_id is not None and konami_id in self.konami_name_map:
+                base_name = self.konami_name_map[konami_id]
+                label = f"{base_name} (None)"
+            elif konami_id is not None:
+                label = f"Konami {konami_id} (None)"
+            else:
+                label = "None"
+            self.card_id_var.set(label)
+        else:
+            display = self._card_id_display_for_index(index_val)
+            self.card_id_var.set(display)
 
     def _get_card_id_index_from_ui(self):
         """
-        Parse the integer card ID index from the combobox string (e.g. '0005:...').
+        Parse card_id_index from combobox:
+        - If text ends with '(None)', treat as 0xFFFF
+        - Else parse leading integer before ':' as the card name index
         """
         val = self.card_id_var.get()
         if not val:
             return 0
-        # Expect 'NNNN: ...'
+        if val.endswith("(None)"):
+            return 0xFFFF
         part = val.split(":", 1)[0].strip()
         try:
             return int(part)
@@ -669,10 +707,6 @@ class RomEditorApp(tk.Tk):
     # =========================
 
     def _populate_card_list(self, filter_text=""):
-        """
-        Populate the listbox with card names, optionally filtered
-        by a substring (case-insensitive).
-        """
         filter_text = filter_text.lower()
         self.card_listbox.delete(0, tk.END)
         self.filtered_indices = []
@@ -689,7 +723,6 @@ class RomEditorApp(tk.Tk):
                 display_name = display_name[:30] + "..."
             self.card_listbox.insert(tk.END, f"{card.index:04d}: {display_name}")
 
-        # Restore selection if possible
         if self.current_index is not None and self.current_index in self.filtered_indices:
             row = self.filtered_indices.index(self.current_index)
             self.card_listbox.selection_set(row)
@@ -707,17 +740,17 @@ class RomEditorApp(tk.Tk):
                  f"Desc addr: {hex(card.desc_addr)}"
         )
 
-        # Text fields
+        # Text
         self.name_var.set(card.name)
         self.desc_text.delete("1.0", tk.END)
         self.desc_text.insert("1.0", card.desc)
 
-        # Stats fields
+        # Stats
         self._updating_konami = True
         self.konami_id_var.set(card.konami_id)
         self._updating_konami = False
 
-        self._set_card_id_ui_from_index(card.card_id_index)
+        self._set_card_id_ui_from_index(card.card_id_index, card.konami_id)
 
         self.artwork_id_var.set(card.artwork_id)
         self.edited_flag_var.set(card.edited_flag)
@@ -730,7 +763,6 @@ class RomEditorApp(tk.Tk):
         self.st_race_var.set(card.st_race)
         self.padding_var.set(card.padding)
 
-        # Update combobox selections if lists exist
         def set_combo_from_index(combo, index_val, values_list):
             if combo is None:
                 return
@@ -744,7 +776,7 @@ class RomEditorApp(tk.Tk):
         set_combo_from_index(self.type_combo, card.type_, self.types_list)
         set_combo_from_index(self.st_race_combo, card.st_race, self.st_races_list)
 
-        # Update listbox selection with respect to current filter
+        # Listbox selection
         if self.filtered_indices:
             try:
                 row = self.filtered_indices.index(index)
@@ -763,7 +795,6 @@ class RomEditorApp(tk.Tk):
     def on_card_selected(self, event):
         if not self.cards or not self.filtered_indices:
             return
-        # Save current card edits before switching
         self.apply_changes()
         sel = self.card_listbox.curselection()
         if not sel:
@@ -774,8 +805,8 @@ class RomEditorApp(tk.Tk):
 
     def apply_changes(self):
         """
-        Save the text and stats from the UI into the current CardEntry object.
-        (Does NOT write to ROM yet.)
+        Save UI → current CardEntry (in memory only).
+        Also refresh Card ID choices so they track renamed cards.
         """
         if self.current_index is None or not self.cards:
             return
@@ -785,7 +816,7 @@ class RomEditorApp(tk.Tk):
         card.name = self.name_var.get()
         card.desc = self.desc_text.get("1.0", tk.END).rstrip("\n")
 
-        # Stats - safe parsing helpers for combobox-backed fields
+        # Stats
         def get_index_from_combo(combo, values_list, numeric_var):
             if combo is None:
                 return numeric_var.get()
@@ -813,7 +844,10 @@ class RomEditorApp(tk.Tk):
         card.attribute = get_index_from_combo(self.attribute_combo, self.attributes_list, self.attribute_var)
         card.type_ = get_index_from_combo(self.type_combo, self.types_list, self.type_var)
         card.st_race = get_index_from_combo(self.st_race_combo, self.st_races_list, self.st_race_var)
-        # padding: left as-is (from ROM)
+
+        # Refresh Card ID dropdown labels to reflect any renamed cards
+        self._update_card_id_choices()
+        self._set_card_id_ui_from_index(card.card_id_index, card.konami_id)
 
     def prev_card(self):
         if self.current_index is None:
@@ -860,7 +894,7 @@ class RomEditorApp(tk.Tk):
     def _on_konami_id_changed(self, *args):
         """
         When Konami ID is changed in the UI, automatically update Card ID
-        from the ROM card ID table for that Konami ID.
+        from the ROM card ID table (and YGOPRODeck if value == 0xFFFF).
         """
         if self._updating_konami:
             return
@@ -874,11 +908,9 @@ class RomEditorApp(tk.Tk):
         except tk.TclError:
             return
 
-        # Read mapping from original ROM card ID table
         card_id_index = self._read_card_id_index_from_table(self.rom_data, konami)
-        self._set_card_id_ui_from_index(card_id_index)
+        self._set_card_id_ui_from_index(card_id_index, konami)
 
-        # Update current CardEntry's in-memory mapping too
         card = self.cards[self.current_index]
         card.konami_id = konami
         card.card_id_index = card_id_index
