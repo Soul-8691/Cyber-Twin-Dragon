@@ -33,6 +33,14 @@ KONAMI_ID_BASE = 4007  # Konami ID offset
 # Number of card name entries
 NUM_CARDS = 2098
 
+# Card artwork table
+ARTWORK_TABLE_BASE = 0x15B5C00
+
+class ArtworkEntry:
+    def __init__(self, index, unk_halfword, card_name_index):
+        self.index = index                 # artwork slot index (0..2330)
+        self.unk_halfword = unk_halfword   # first 2 bytes, unknown but editable
+        self.card_name_index = card_name_index  # second 2 bytes: index into card names table
 
 class CardEntry:
     def __init__(
@@ -115,9 +123,34 @@ class RomEditorApp(tk.Tk):
         self._updating_konami_main = False
         self._updating_konami_sec = False
 
+        self.artworks = []                 # list[ArtworkEntry]
+        self.current_artwork_index = 0
+        self._updating_artwork_index = False
+
+        self.artwork_names = []
+
         self._load_text_mappings()
         self._load_json_mappings()
         self._build_ui()
+
+    def _parse_artworks(self):
+        data = self.rom_data
+        artworks = []
+        for i in range(NUM_CARDS):
+            off = ARTWORK_TABLE_BASE + i * 4
+            if off + 4 > len(data):
+                break
+            unk = self._read_u16(data, off)
+
+            stored = self._read_u16(data, off + 2)
+            # Artwork table stores (card_name_index - 1)
+            if stored == 0xFFFF:
+                card_idx = 0xFFFF  # optional sentinel handling, if ever used
+            else:
+                card_idx = stored + 1
+
+            artworks.append(ArtworkEntry(i, unk, card_idx))
+        self.artworks = artworks
 
     # =========================
     # LOAD TEXT / JSON MAPPINGS
@@ -140,6 +173,9 @@ class RomEditorApp(tk.Tk):
         self.attributes_list = load_lines(os.path.join("..", "text", "attributes.txt"))
         self.types_list = load_lines(os.path.join("..", "text", "types.txt"))
         self.st_races_list = load_lines(os.path.join("..", "text", "spell_trap_races.txt"))
+
+        # NEW: artwork names (one per line, 2331 total)
+        self.artwork_names = load_lines(os.path.join("..", "text", "card_graphics_indexes.txt"))
 
     def _load_json_mappings(self):
         try:
@@ -244,8 +280,11 @@ class RomEditorApp(tk.Tk):
 
         stats_main_frame = tk.Frame(stats_notebook)
         stats_sec_frame = tk.Frame(stats_notebook)
+        artwork_frame = tk.Frame(stats_notebook)
+
         stats_notebook.add(stats_main_frame, text="Main Stats")
         stats_notebook.add(stats_sec_frame, text="Secondary Stats")
+        stats_notebook.add(artwork_frame, text="Artwork Table")
 
         # MAIN stats vars
         self.konami_main_var = tk.IntVar()
@@ -274,6 +313,12 @@ class RomEditorApp(tk.Tk):
         self.type_sec_var = tk.IntVar()
         self.st_race_sec_var = tk.IntVar()
         self.padding_sec_var = tk.IntVar()
+
+        # Artwork table vars
+        self.artwork_index_var = tk.IntVar(value=0)
+        self.artwork_unk_var = tk.StringVar()
+        self.artwork_card_var = tk.StringVar()
+        self.artwork_name_var = tk.StringVar()  # resolved artwork name from card_graphics_indexes.txt
 
         def add_numeric_row(frame, row, label, var, width=8):
             tk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=2, pady=1)
@@ -340,6 +385,30 @@ class RomEditorApp(tk.Tk):
         self.padding_sec_entry.grid(row=row, column=1, sticky="w", padx=2, pady=1)
         row += 1
 
+        # ---------- Artwork Table UI ----------
+        row = 0
+        tk.Label(artwork_frame, text="Unknown halfword:").grid(row=row, column=0, sticky="w", padx=2, pady=1)
+        self.artwork_unk_combo = ttk.Combobox(
+            artwork_frame,
+            textvariable=self.artwork_unk_var,
+            values=self.artwork_names,
+            state="readonly",
+            width=40
+        )
+        self.artwork_unk_combo.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+        row += 1
+
+        tk.Label(artwork_frame, text="Card (Name Index):").grid(row=row, column=0, sticky="w", padx=2, pady=1)
+        self.artwork_card_combo = ttk.Combobox(
+            artwork_frame,
+            textvariable=self.artwork_card_var,
+            values=self.artwork_names,
+            state="readonly",
+            width=40
+        )
+        self.artwork_card_combo.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+        row += 1
+
         # Buttons
         button_frame = tk.Frame(right_frame)
         button_frame.pack(fill=tk.X, pady=5)
@@ -378,6 +447,7 @@ class RomEditorApp(tk.Tk):
 
         try:
             self.cards = self._parse_cards()
+            self._parse_artworks()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to parse ROM:\n{e}")
             self.rom_data = None
@@ -388,6 +458,8 @@ class RomEditorApp(tk.Tk):
         self.current_index = 0
         self.clear_filter()
         self._load_card_into_editor(0)
+        if self.artworks:
+            self._load_artwork_into_editor(0)
         self._update_controls_state()
         self.info_label.config(text=f"Loaded ROM: {os.path.basename(self.rom_path)} ({NUM_CARDS} cards)")
 
@@ -716,9 +788,10 @@ class RomEditorApp(tk.Tk):
             self._write_string_and_update_pointer(rom_copy, card, is_name=False)
             self._write_stats_primary(rom_copy, card)
             self._write_stats_secondary(rom_copy, card)
-            # Only primary stats update the card ID table, to avoid
-            # fighting with the secondary-table index-based mapping.
             self._write_card_id_entry(rom_copy, card.konami_id, card.card_id_index)
+
+        # After all cards, write artwork table
+        self._write_artwork_table(rom_copy)
 
     # =========================
     # CARD ID UI
@@ -736,6 +809,70 @@ class RomEditorApp(tk.Tk):
         self.card_id_choices = [self._card_id_display_for_index(i) for i in range(len(self.cards))]
         self.card_id_main_combo["values"] = self.card_id_choices
         self.card_id_sec_combo["values"] = self.card_id_choices
+        if hasattr(self, "artwork_card_combo"):
+            self.artwork_card_combo["values"] = self.card_id_choices
+        self.artwork_unk_combo["values"] = self.artwork_names
+        self.artwork_card_combo["values"] = self.artwork_names
+
+    def _load_artwork_into_editor(self, idx):
+        if not self.artworks or not (0 <= idx < len(self.artworks)):
+            return
+
+        entry = self.artworks[idx]
+        self.current_artwork_index = idx
+
+        # Prevent spinbox recursion
+        self._updating_artwork_index = True
+        self.artwork_index_var.set(idx)
+        self._updating_artwork_index = False
+
+        # ------- FIRST HALFWORD -------
+        unk_idx = entry.unk_halfword
+        if 0 <= unk_idx < len(self.artwork_names):
+            self.artwork_unk_var.set(self.artwork_names[unk_idx])
+        else:
+            self.artwork_unk_var.set("")
+
+        # ------- SECOND HALFWORD -------
+        # Read raw second halfword
+        off2 = ARTWORK_TABLE_BASE + idx*4 + 2
+        stored = self._read_u16(self.rom_data, off2)
+        if 0 <= stored < len(self.artwork_names):
+            self.artwork_card_var.set(self.artwork_names[stored])
+        else:
+            self.artwork_card_var.set("")
+
+        # ------- Resolved name label (optional) -------
+        self.artwork_name_var.set(
+            f"Unk→ {self.artwork_unk_var.get()}   |   CardIdx→ {self.artwork_card_var.get()}"
+        )
+
+    def on_artwork_index_changed(self):
+        if self._updating_artwork_index:
+            return
+        # Save current artwork entry before switching
+        self._apply_artwork_ui_to_entry()
+        idx = self.artwork_index_var.get()
+        self._load_artwork_into_editor(idx)
+
+    def _apply_artwork_ui_to_entry(self):
+        if not self.artworks:
+            return
+        idx = self.artwork_index_var.get()
+        if not (0 <= idx < len(self.artworks)):
+            return
+
+        entry = self.artworks[idx]
+
+        # -------- FIRST HALFWORD --------
+        unk_name = self.artwork_unk_var.get()
+        if unk_name in self.artwork_names:
+            entry.unk_halfword = self.artwork_names.index(unk_name)
+
+        # -------- SECOND HALFWORD --------
+        card_name = self.artwork_card_var.get()
+        if card_name in self.artwork_names:
+            entry.card_name_index = self.artwork_names.index(card_name)
 
     def _set_card_id_ui(self, var_obj, index_val, konami_id=None):
         """
@@ -872,6 +1009,12 @@ class RomEditorApp(tk.Tk):
             if index < self.card_listbox.size():
                 self.card_listbox.selection_set(index)
                 self.card_listbox.see(index)
+        
+        # --- NEW: sync Artwork tab to this card's Artwork # ---
+        if self.artworks:
+            art_idx = card.card_id_index2 - 1
+            if 0 <= art_idx < len(self.artworks):
+                self._load_artwork_into_editor(art_idx)
 
     def on_card_selected(self, event):
         if not self.cards or not self.filtered_indices:
@@ -883,6 +1026,19 @@ class RomEditorApp(tk.Tk):
         row = sel[0]
         idx = self.filtered_indices[row]
         self._load_card_into_editor(idx)
+
+    def _write_artwork_table(self, rom_data):
+        for entry in self.artworks:
+            off = ARTWORK_TABLE_BASE + entry.index * 4
+            if off + 4 > len(rom_data):
+                break
+
+            # Write first halfword
+            self._write_u16(rom_data, off, entry.unk_halfword - 1)
+
+            # Write second halfword
+            if entry.card_name_index > 0:
+                self._write_u16(rom_data, off + 2, entry.card_name_index - 1)
 
     def apply_changes(self):
         if self.current_index is None or not self.cards:
@@ -938,6 +1094,9 @@ class RomEditorApp(tk.Tk):
         self._update_card_id_choices()
         self._set_card_id_ui(self.card_id_main_var, card.card_id_index, card.konami_id)
         self._set_card_id_ui(self.card_id_sec_var, card.card_id_index2, card.konami2)
+
+        # Also store current artwork entry edits
+        self._apply_artwork_ui_to_entry()
 
     def prev_card(self):
         if self.current_index is None:
