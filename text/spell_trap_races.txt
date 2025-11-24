@@ -1,0 +1,7 @@
+Normal
+Counter
+Field
+Equip
+Continuous
+Quick-Play
+Ritual

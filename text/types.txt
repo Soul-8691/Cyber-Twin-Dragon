@@ -1,0 +1,15 @@
+Normal Monster
+Effect Monster
+Fusion Monster
+Fusion/Effect Monster
+Ritual Monster
+Ritual/Effect Monster
+Toon Monster
+Spirit Monster
+Union Monster
+Token
+None
+None
+None
+Spell Card
+Trap Card

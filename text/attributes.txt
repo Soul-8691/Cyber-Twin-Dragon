@@ -1,0 +1,10 @@
+None
+LIGHT
+DARK
+WATER
+FIRE
+EARTH
+WIND
+DIVINE
+Spell Card
+Trap Card

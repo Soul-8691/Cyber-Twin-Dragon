@@ -1,0 +1,24 @@
+None
+Dragon
+Zombie
+Fiend
+Pyro
+Sea Serpent
+Rock
+Machine
+Fish
+Dinosaur
+Insect
+Beast
+Beast-Warrior
+Plant
+Aqua
+Warrior
+Winged Beast
+Fairy
+Spellcaster
+Thunder
+Reptile
+Divine-Beast
+Spell Card
+Trap Card
