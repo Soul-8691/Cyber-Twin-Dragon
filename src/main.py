@@ -667,7 +667,7 @@ class RomEditorApp(tk.Tk):
     def open_rom(self):
         path = filedialog.askopenfilename(
             title="Select Yu-Gi-Oh! Ultimate Masters GBA ROM",
-            filetypes=[("GBA ROM", "*.gba;*.bin;*.*"), ("All files", "*.*")]
+            filetypes=[("GBA ROM", "*.gba"), ("All files", "*.*")]
         )
         if not path:
             return
@@ -709,7 +709,7 @@ class RomEditorApp(tk.Tk):
         save_path = filedialog.asksaveasfilename(
             title="Save modified ROM as",
             defaultextension=".gba",
-            filetypes=[("GBA ROM", "*.gba;*.bin;*.*")]
+            filetypes=[("GBA ROM", "*.gba")]
         )
         if not save_path:
             return
