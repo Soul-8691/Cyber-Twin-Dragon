@@ -1374,7 +1374,7 @@ class RomEditorApp(tk.Tk):
             return None
 
         # Prefer the artwork entry currently shown in the Artwork tab
-        art_idx = getattr(self, "current_artwork_index", None)
+        art_idx = getattr(self, "current_artwork_index", None) + 1
         if art_idx is None:
             # Fallback: use the primary Artwork # field for the current card
             if self.current_index is None:
