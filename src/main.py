@@ -80,6 +80,8 @@ LARGE_ICON_HEIGHT = 48  # 32 * 48 = 1536 = 0x600
 SMALL_ICON_WIDTH  = 24
 SMALL_ICON_HEIGHT = 24  # 24 * 24 = 576 = 0x240
 
+IMAGES_DIR = os.path.join(os.path.dirname(__file__), "../images")
+
 class ArtworkEntry:
     def __init__(self, index, unk_halfword, card_name_index):
         self.index = index                 # artwork slot index (0..2330)
@@ -241,6 +243,171 @@ class RomEditorApp(tk.Tk):
                 break
 
             self._write_u16(rom_data, off, sort_value)
+
+    def _get_icon_template_path(self, card, label: str) -> str:
+        """
+        Build the filename for the icon template PNG, using the same logic
+        as in _decode_icon_to_photoimage:
+
+            type_name = self.types_list[card.type_]
+            safe = type_name.replace(' ', '_').replace('/', '_').lower()
+            filename = f"{safe}_{label}.png"
+        """
+        type_name = self.types_list[card.type_]
+        safe = type_name.replace(' ', '_').replace('/', '_').lower()
+        filename = f"{safe}_{label}.png"
+        return os.path.join(IMAGES_DIR, filename)
+
+    def _import_icons_from_card_image(self, card, card_rgb_80: Image.Image):
+        """
+        From full card image (80x80 RGB), build and import:
+          - Large icon (32x48, card shrunk to 30x30 at (1, 9))
+          - Small icon (24x24, card shrunk to 14x14 at (5, 5))
+          - Small sideways icon (same 14x14, rotated right 90°, pasted at (5, 5))
+
+        Each icon is created by:
+          - starting from a card sprite
+          - pasting the type template PNG on top
+          - quantizing to the shared icon palette
+          - encoding to 8bpp and writing into the icon tables
+        """
+        if self.rom_data is None:
+            return
+
+        icon_idx = self._get_gfx_index_from_current_artwork()
+        if icon_idx is None or icon_idx < 0:
+            return
+
+        # Offsets in the icon tables
+        large_off = LARGE_ICON_BASE + icon_idx * LARGE_ICON_SIZE
+        small_off = SMALL_ICON_BASE + icon_idx * SMALL_ICON_ENTRY_SIZE
+
+        if (large_off + LARGE_ICON_SIZE > len(self.rom_data) or
+            small_off + SMALL_ICON_ENTRY_SIZE > len(self.rom_data)):
+            messagebox.showerror("Error", "Icon data would be written out of ROM bounds.")
+            return
+
+        # --- prepare base sprites from the 80x80 card image ---
+        # Work in RGBA so we can paste under transparent templates
+        def _get_icon_template_path(self, card, label: str) -> str:
+            type_name = self.types_list[card.type_]
+            safe = type_name.replace(' ', '_').replace('/', '_').lower()
+            filename = f"{safe}_{label}.png"
+            return os.path.join(IMAGES_DIR, filename)
+
+        # Helper to build final icon using a template
+        card_rgba_80 = card_rgb_80.convert("RGBA")
+        large_sprite = card_rgba_80.resize((30, 30), Image.LANCZOS)
+        small_sprite = card_rgba_80.resize((14, 14), Image.LANCZOS)
+        small_side_sprite = small_sprite.rotate(-90, expand=False)  # 90° right
+
+        def build_icon_with_template(sprite: Image.Image,
+                                     label: str,
+                                     icon_w: int,
+                                     icon_h: int,
+                                     offset: tuple[int, int]) -> Image.Image:
+            """
+            Start from the type template PNG, then paste the card sprite on top.
+            """
+            tpl_path = self._get_icon_template_path(card, label)
+            try:
+                tpl = Image.open(tpl_path).convert("RGBA")
+            except FileNotFoundError:
+                messagebox.showerror("Error", f"Template not found:\n{tpl_path}")
+                raise
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load template {tpl_path}:\n{e}")
+                raise
+
+            if tpl.size != (icon_w, icon_h):
+                tpl = tpl.resize((icon_w, icon_h), Image.LANCZOS)
+
+            # Start from the template
+            base = tpl.copy()
+
+            # Paste sprite ON TOP of the template, preserving sprite alpha if present
+            if sprite.mode != "RGBA":
+                sprite = sprite.convert("RGBA")
+            base.paste(sprite, offset, sprite)
+
+            # Final icon to quantize: RGB
+            return base.convert("RGB")
+
+        large_icon_rgb = build_icon_with_template(
+            large_sprite, "large",
+            LARGE_ICON_WIDTH, LARGE_ICON_HEIGHT,
+            (1, 9)
+        )
+        small_icon_rgb = build_icon_with_template(
+            small_sprite, "small",
+            SMALL_ICON_WIDTH, SMALL_ICON_HEIGHT,
+            (5, 5)
+        )
+        small_side_icon_rgb = build_icon_with_template(
+            small_side_sprite, "small_side",
+            SMALL_ICON_WIDTH, SMALL_ICON_HEIGHT,
+            (5, 5)
+        )
+
+        # --- Quantize to the icon palette ---
+        try:
+            large_p = self._quantize_to_icon_palette(large_icon_rgb)
+            small_p = self._quantize_to_icon_palette(small_icon_rgb)
+            small_side_p = self._quantize_to_icon_palette(small_side_icon_rgb)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to quantize icons to icon palette:\n{e}")
+            return
+
+        # --- Encode with gbagfx to raw 8bpp data and write into ROM ---
+        import tempfile, subprocess, os
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            def encode_icon_png(img_p, fname, w, h, expected_size):
+                png_path = os.path.join(tmpdir, fname + ".png")
+                bin_path = os.path.join(tmpdir, fname + ".8bpp")
+
+                img_p.save(png_path)
+
+                cmd = [
+                    GBAGFX_PATH,
+                    png_path,
+                    bin_path,
+                    "-mwidth", str(w / 8),
+                ]
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                with open(bin_path, "rb") as f:
+                    data = f.read()
+                if len(data) != expected_size:
+                    raise ValueError(
+                        f"{fname}: expected {expected_size:#x} bytes, got {len(data):#x}"
+                    )
+                return data
+
+            try:
+                large_data = encode_icon_png(
+                    large_p, "large_icon",
+                    LARGE_ICON_WIDTH, LARGE_ICON_HEIGHT,
+                    LARGE_ICON_SIZE
+                )
+                small_data = encode_icon_png(
+                    small_p, "small_icon",
+                    SMALL_ICON_WIDTH, SMALL_ICON_HEIGHT,
+                    SMALL_ICON_SIZE
+                )
+                small_side_data = encode_icon_png(
+                    small_side_p, "small_side_icon",
+                    SMALL_ICON_WIDTH, SMALL_ICON_HEIGHT,
+                    SMALL_ICON_SIZE
+                )
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to encode icons with gbagfx:\n{e}")
+                return
+
+        # Write into ROM
+        self.rom_data[large_off:large_off + LARGE_ICON_SIZE] = large_data
+        self.rom_data[small_off:small_off + SMALL_ICON_SIZE] = small_data
+        self.rom_data[small_off + SMALL_ICON_SIZE:small_off + SMALL_ICON_ENTRY_SIZE] = small_side_data
 
     def _parse_artworks(self):
         data = self.rom_data
@@ -507,13 +674,13 @@ class RomEditorApp(tk.Tk):
 
         try:
             self.large_icon_photo = self._decode_icon_to_photoimage(
-                large_data, pal_256, LARGE_ICON_WIDTH, LARGE_ICON_HEIGHT
+                card, 'large', large_data, pal_256, LARGE_ICON_WIDTH, LARGE_ICON_HEIGHT
             )
             self.small_icon_photo = self._decode_icon_to_photoimage(
-                small_reg_data, pal_256, SMALL_ICON_WIDTH, SMALL_ICON_HEIGHT
+                card, 'small', small_reg_data, pal_256, SMALL_ICON_WIDTH, SMALL_ICON_HEIGHT
             )
             self.small_side_icon_photo = self._decode_icon_to_photoimage(
-                small_side_data, pal_256, SMALL_ICON_WIDTH, SMALL_ICON_HEIGHT
+                card, 'small_side', small_side_data, pal_256, SMALL_ICON_WIDTH, SMALL_ICON_HEIGHT
             )
         except Exception:
             clear_icons("(decode error)")
@@ -524,7 +691,7 @@ class RomEditorApp(tk.Tk):
         self.small_icon_label.config(image=self.small_icon_photo, text="")
         self.small_side_icon_label.config(image=self.small_side_icon_photo, text="")
 
-    def _decode_icon_to_photoimage(self, gfx_data: bytes, pal_256: bytes,
+    def _decode_icon_to_photoimage(self, card: CardEntry, label: str, gfx_data: bytes, pal_256: bytes,
                                    width: int, height: int) -> ImageTk.PhotoImage:
         """
         Take raw 8bpp tile data + GBA-format palette and turn it into
@@ -625,28 +792,29 @@ class RomEditorApp(tk.Tk):
         self.info_label = tk.Label(right_frame, text="No ROM loaded.")
         self.info_label.pack(anchor="w", pady=(0, 5))
 
-        # --- Card artwork preview ---
-        image_frame = tk.Frame(right_frame)
-        image_frame.pack(anchor="center", pady=(0, 5))
+        # --- Card artwork + icons row ---
+        art_row = tk.Frame(right_frame)
+        art_row.pack(anchor="w", pady=(0, 5))
+
+        # Main card image
+        image_frame = tk.Frame(art_row)
+        image_frame.grid(row=0, column=0, sticky="nw")
         self.card_image_label = tk.Label(image_frame, text="(no art)")
         self.card_image_label.pack()
-        self.card_photo = None  # keep reference to avoid GC
+        self.card_photo = None
 
-                # --- Card icon previews ---
-        icon_frame = tk.LabelFrame(right_frame, text="Card Icons")
-        icon_frame.pack(anchor="center", pady=(5, 5), fill="x")
+        # Card icon previews, to the right of main art
+        icon_frame = tk.Frame(art_row)
+        icon_frame.grid(row=0, column=1, sticky="nw", padx=6)
 
-        # Large icon
         self.large_icon_label = tk.Label(icon_frame, text="(large)")
-        self.large_icon_label.grid(row=0, column=0, padx=4, pady=2)
+        self.large_icon_label.grid(row=0, column=0, padx=2)
 
-        # Small regular icon
         self.small_icon_label = tk.Label(icon_frame, text="(small)")
-        self.small_icon_label.grid(row=0, column=1, padx=4, pady=2)
+        self.small_icon_label.grid(row=0, column=1, padx=2)
 
-        # Small sideways icon
         self.small_side_icon_label = tk.Label(icon_frame, text="(sideways)")
-        self.small_side_icon_label.grid(row=0, column=2, padx=4, pady=2)
+        self.small_side_icon_label.grid(row=0, column=2, padx=2)
 
         # Keep references so Tk doesn't GC the images
         self.large_icon_photo = None
@@ -1449,7 +1617,7 @@ class RomEditorApp(tk.Tk):
 
             # Write second halfword
             if entry.card_name_index > 0:
-                self._write_u16(rom_data, off + 2, entry.card_name_index - 1)
+                self._write_u16(rom_data, off + 2, entry.card_name_index)
 
     def apply_changes(self):
         if self.current_index is None or not self.cards:
@@ -1556,6 +1724,47 @@ class RomEditorApp(tk.Tk):
         # stored is the 0-based graphics index you described earlier
         return stored
 
+    def _build_pillow_icon_palette(self):
+        """
+        Build a Pillow 'P' image containing the 144-color icon palette
+        from ICON_PAL_BASE (0x510440), padded to 256 colors.
+        """
+        pal_raw = self._get_icon_palette()
+        if pal_raw is None:
+            return None
+
+        # GBA 15-bit color: 0-4 red, 5-9 green, 10-14 blue
+        colors = []
+        for i in range(0, len(pal_raw), 2):
+            val = pal_raw[i] | (pal_raw[i + 1] << 8)
+            r = (val & 0x1F) * 255 // 31
+            g = ((val >> 5) & 0x1F) * 255 // 31
+            b = ((val >> 10) & 0x1F) * 255 // 31
+            colors.extend([r, g, b])
+
+        # Pad to 256 entries
+        while len(colors) < 256 * 3:
+            colors.extend([0, 0, 0])
+
+        pal_img = Image.new("P", (1, 1))
+        pal_img.putpalette(colors)
+        return pal_img
+    
+    def _quantize_to_icon_palette(self, img_rgb: Image.Image) -> Image.Image:
+        """
+        Takes an RGB image and quantizes it to the card icon palette
+        at 0x510440. Returns a 'P' mode image whose palette matches
+        the ROM's icon palette.
+        """
+        pal_img = self._build_pillow_icon_palette()
+        if pal_img is None:
+            raise RuntimeError("Icon palette not available")
+
+        return img_rgb.convert("RGB").quantize(
+            palette=pal_img,
+            dither=Image.NONE
+        )
+
     def load_card_graphics(self):
         """
         Import a square PNG for the current artwork entry, process it, and
@@ -1616,6 +1825,10 @@ class RomEditorApp(tk.Tk):
         # so quantization doesn't depend on PNG alpha weirdness.
         bg = Image.new("RGB", (80, 80), (0, 0, 0))
         bg.paste(img, mask=img.split()[3])  # use alpha channel as mask
+        
+        # This is the “master” card image for icons
+        card_rgb_80 = bg.copy()
+        
         img = bg  # now RGB
 
         # --- Quantize to 64 colors ---
@@ -1701,10 +1914,15 @@ class RomEditorApp(tk.Tk):
             f"Updated graphics slot {gfx_index} at {hex(gfx_off)} and palette at {hex(pal_off)}."
         )
 
+        # After writing gfx/pal for the main 6bpp artwork:
+        card = self.cards[self.current_index]
+        self._import_icons_from_card_image(card, card_rgb_80)
+
         # Optionally refresh your preview image, if you already have that hooked up
         try:
             # Replace this with whatever function you're using now to draw the card art
-            self._render_card_image(self.cards[self.current_index])
+            self._render_card_image(card)
+            self._render_card_icons(card)
         except Exception:
             pass
 
