@@ -4,6 +4,10 @@ from tkinter.scrolledtext import ScrolledText
 from tkinter import ttk
 import os
 import json
+from PIL import Image, ImageTk
+import subprocess
+import tempfile
+import traceback
 
 # =========================
 # CONSTANTS FOR THIS ROM
@@ -41,6 +45,19 @@ NAME_SORT_TABLE_BASE = 0x1832606  # 2 bytes per entry, little endian
 
 NAME_SORT_EXCLUDE_START = 2080  # 0-indexed, inclusive
 NAME_SORT_EXCLUDE_END = 2097    # 0-indexed, inclusive
+
+# =========================
+# CARD ART CONSTANTS
+# =========================
+
+CARD_GFX_BASE = 0x510640       # start of 6bpp card graphics
+CARD_GFX_SIZE = 0x12C0         # bytes per card graphic (80x80 @ 6bpp -> 4800 bytes)
+CARD_PAL_BASE = 0x4C76C0       # start of card palettes
+CARD_PAL_SIZE = 0x80           # bytes per card palette (64 colors * 2 bytes)
+NUM_CARD_GFX = 2331            # total graphics slots
+
+# Path to gbagfx executable (adjust to where you keep it)
+GBAGFX_PATH = "deps/gbagfx"
 
 class ArtworkEntry:
     def __init__(self, index, unk_halfword, card_name_index):
@@ -223,6 +240,144 @@ class RomEditorApp(tk.Tk):
             artworks.append(ArtworkEntry(i, unk, card_idx))
         self.artworks = artworks
 
+    def _decode_6bpp_to_8bpp(self, data_6bpp: bytes) -> bytes:
+        """
+        Convert 80x80 6bpp data (4800 bytes) into 80x80 8bpp (6400 bytes).
+
+        We treat every 3 bytes as a little-endian 24-bit integer:
+        v = a | (b << 8) | (c << 16)
+
+        Then extract 4 successive 6-bit indices:
+        p0 = bits  0..5
+        p1 = bits  6..11
+        p2 = bits 12..17
+        p3 = bits 18..23
+
+        Each 6-bit value (0..63) is stored in a full byte so gbagfx
+        can treat it as 8bpp indexed data.
+        """
+        if len(data_6bpp) != CARD_GFX_SIZE:
+            raise ValueError(f"Expected {CARD_GFX_SIZE} bytes of 6bpp data, got {len(data_6bpp)}")
+
+        out = bytearray()
+
+        for i in range(0, len(data_6bpp), 3):
+            a = data_6bpp[i]
+            b = data_6bpp[i + 1]
+            c = data_6bpp[i + 2]
+
+            v = a | (b << 8) | (c << 16)
+
+            out.append((v >> 0)  & 0x3F)
+            out.append((v >> 6)  & 0x3F)
+            out.append((v >> 12) & 0x3F)
+            out.append((v >> 18) & 0x3F)
+
+        if len(out) != 80 * 80:
+            raise ValueError(f"Decoded 6bpp length mismatch: {len(out)} pixels")
+
+        return bytes(out)
+
+    def _render_card_image(self, card: CardEntry):
+        """
+        Extracts this card's 6bpp art and palette from the ROM,
+        converts to 8bpp, runs gbagfx to make a PNG, horizontally
+        flips it with Pillow, and displays it in the Tkinter label.
+        """
+        if self.rom_data is None:
+            self.card_image_label.config(image="", text="(no ROM)")
+            self.card_photo = None
+            return
+
+        gfx_index = self._get_graphics_index_for_card(card)
+        if gfx_index is None:
+            self.card_image_label.config(image="", text="(no art)")
+            self.card_photo = None
+            return
+
+        # --- Compute ROM offsets for this graphic + palette ---
+        gfx_off = CARD_GFX_BASE + gfx_index * CARD_GFX_SIZE
+        pal_off = CARD_PAL_BASE + gfx_index * CARD_PAL_SIZE
+
+        if gfx_off + CARD_GFX_SIZE > len(self.rom_data) or pal_off + CARD_PAL_SIZE > len(self.rom_data):
+            self.card_image_label.config(image="", text="(art out of range)")
+            self.card_photo = None
+            return
+
+        data_6bpp = bytes(self.rom_data[gfx_off:gfx_off + CARD_GFX_SIZE])
+        pal_raw  = bytes(self.rom_data[pal_off:pal_off + CARD_PAL_SIZE])
+
+        # --- Convert 6bpp → 8bpp ---
+        data_8bpp = self._decode_6bpp_to_8bpp(data_6bpp)
+
+        # --- Prepare temp files for gbagfx ---
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gfx_path = os.path.join(tmpdir, "card.8bpp")
+            pal_path = os.path.join(tmpdir, "card.gbapal")
+            png_path = os.path.join(tmpdir, "card.png")
+
+            # Write 6400 bytes of 8bpp index data
+            with open(gfx_path, "wb") as f:
+                f.write(data_8bpp)
+
+            # gbagfx expects a 256-color palette (0x200 bytes) for 8bpp;
+            # we have 64 entries (0x80 bytes), so just pad with zeros.
+            pal_data = pal_raw + b"\x00" * (0x200 - len(pal_raw))
+            with open(pal_path, "wb") as f:
+                f.write(pal_data)
+
+            # --- Call gbagfx to build the PNG ---
+            # Adjust flags if your gbagfx version uses different syntax.
+            cmd = [
+                GBAGFX_PATH,
+                gfx_path,
+                png_path,
+                "-palette", pal_path,
+                "-mwidth", "10",
+            ]
+
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except Exception as e:
+                traceback.print_exc()
+                self.card_photo = None
+                return
+
+            # --- Open PNG, flip horizontally, and show in Tkinter ---
+            try:
+                img = Image.open(png_path)
+                self.card_photo = ImageTk.PhotoImage(img)
+                self.card_image_label.config(image=self.card_photo, text="")
+            except Exception:
+                self.card_image_label.config(image="", text="(image load error)")
+                self.card_photo = None
+
+    def _get_graphics_index_for_card(self, card: CardEntry):
+        """
+        Returns the 0-based graphics index to use for this card:
+        - Use the artwork slot (Artwork #) just to pick the row
+        - Then use that row's second halfword ("Card (Name Index)")
+            as the actual graphics/palette index.
+        """
+        if self.rom_data is None:
+            return None
+
+        # Which artwork slot are we using? (primary here, adjust if you prefer secondary)
+        slot = card.card_id_index
+        if slot < 0:
+            return None
+
+        # Second halfword of artwork entry = Card (Name Index) (0-based)
+        off = ARTWORK_TABLE_BASE + slot * 4 + 2
+        if off + 2 > len(self.rom_data):
+            return None
+
+        gfx_index = self._read_u16(self.rom_data, off)  # 0..2330
+        if not (0 <= gfx_index < NUM_CARD_GFX):
+            return None
+
+        return gfx_index
+
     # =========================
     # LOAD TEXT / JSON MAPPINGS
     # =========================
@@ -329,6 +484,16 @@ class RomEditorApp(tk.Tk):
 
         self.info_label = tk.Label(right_frame, text="No ROM loaded.")
         self.info_label.pack(anchor="w", pady=(0, 5))
+
+        self.info_label = tk.Label(right_frame, text="No ROM loaded.")
+        self.info_label.pack(anchor="w", pady=(0, 5))
+
+        # --- Card artwork preview ---
+        image_frame = tk.Frame(right_frame)
+        image_frame.pack(anchor="center", pady=(0, 5))
+        self.card_image_label = tk.Label(image_frame, text="(no art)")
+        self.card_image_label.pack()
+        self.card_photo = None  # keep reference to avoid GC
 
         # Name
         name_frame = tk.Frame(right_frame)
@@ -1086,9 +1251,12 @@ class RomEditorApp(tk.Tk):
         
         # --- NEW: sync Artwork tab to this card's Artwork # ---
         if self.artworks:
-            art_idx = card.card_id_index2 - 1
+            art_idx = card.card_id_index - 1
             if 0 <= art_idx < len(self.artworks):
                 self._load_artwork_into_editor(art_idx)
+
+        # --- NEW: render card artwork image ---
+        self._render_card_image(card)
 
     def on_card_selected(self, event):
         if not self.cards or not self.filtered_indices:
