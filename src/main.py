@@ -1800,15 +1800,24 @@ class RomEditorApp(tk.Tk):
             return
 
         # --- Select PNG file ---
-        png_path = filedialog.askopenfilename(
+        img_path = filedialog.askopenfilename(
             title="Select card artwork PNG",
-            filetypes=[("PNG Images", "*.png"), ("All Files", "*.*")]
+            filetypes=[("PNG Images", "*.png"), ("JPEG Images", "*.jpg"), ("All Files", "*.*")]
         )
-        if not png_path:
+        if not img_path:
             return
 
         try:
-            img = Image.open(png_path).convert("RGBA")
+            img = Image.open(img_path)
+
+            # JPGs have no alpha; PNGs may or may not.
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGBA")
+            else:
+                # If it's RGB (e.g., JPG), add alpha channel for consistency:
+                if img.mode == "RGB":
+                    img = img.convert("RGBA")
+
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load image:\n{e}")
             return
