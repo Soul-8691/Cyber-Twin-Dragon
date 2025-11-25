@@ -645,6 +645,16 @@ class RomEditorApp(tk.Tk):
         self.artwork_card_combo.grid(row=row, column=1, sticky="w", padx=2, pady=1)
         row += 1
 
+        # Load/import art for the currently selected artwork entry
+        self.load_gfx_button = tk.Button(
+            artwork_frame,
+            text="Load Card Graphics...",
+            command=self.load_card_graphics,
+            state=tk.DISABLED  # enabled once a ROM is loaded
+        )
+        self.load_gfx_button.grid(row=row, column=0, columnspan=2, pady=(5, 0), sticky="w")
+        row += 1
+
         # Buttons
         button_frame = tk.Frame(right_frame)
         button_frame.pack(fill=tk.X, pady=5)
@@ -1354,11 +1364,198 @@ class RomEditorApp(tk.Tk):
             self.apply_changes()
             self._load_card_into_editor(self.current_index + 1)
 
+    def _get_gfx_index_from_current_artwork(self):
+        """
+        Uses the current artwork table entry and reads its second halfword
+        ("Card (Name Index)" in the Artwork tab) directly from the ROM.
+        That value is the 0-based graphics/palette index.
+        """
+        if self.rom_data is None or not self.artworks:
+            return None
+
+        # Prefer the artwork entry currently shown in the Artwork tab
+        art_idx = getattr(self, "current_artwork_index", None)
+        if art_idx is None:
+            # Fallback: use the primary Artwork # field for the current card
+            if self.current_index is None:
+                return None
+            card = self.cards[self.current_index]
+            art_idx = card.artwork_id
+
+        if not (0 <= art_idx < len(self.artworks)):
+            return None
+
+        # Second halfword = Card (Name Index), 0-based index into card_graphics_indexes / art tables
+        off = ARTWORK_TABLE_BASE + art_idx * 4 + 2
+        if off + 2 > len(self.rom_data):
+            return None
+
+        stored = self._read_u16(self.rom_data, off)
+        if stored == 0xFFFF:  # if you ever use this sentinel
+            return None
+
+        # stored is the 0-based graphics index you described earlier
+        return stored
+
+    def load_card_graphics(self):
+        """
+        Import a square PNG for the current artwork entry, process it, and
+        write the resulting 6bpp graphic and palette into the ROM:
+
+          - resize to 80x80
+          - reduce to 64 colors
+          - flip each 8x8 tile horizontally
+          - convert to 6bpp via custom gbagfx
+          - insert at CARD_GFX_BASE / CARD_PAL_BASE for this graphics index
+        """
+        if self.rom_data is None or not self.cards:
+            messagebox.showinfo("No ROM", "Load a ROM first.")
+            return
+
+        if self.current_index is None:
+            messagebox.showinfo("No card selected", "Select a card first.")
+            return
+
+        gfx_index = self._get_gfx_index_from_current_artwork()
+        if gfx_index is None:
+            messagebox.showerror("Error", "Could not resolve Card (Name Index) / graphics index.")
+            return
+
+        if not (0 <= gfx_index < NUM_CARD_GFX):
+            messagebox.showerror("Error", f"Graphics index {gfx_index} is out of range.")
+            return
+
+        gfx_off = CARD_GFX_BASE + gfx_index * CARD_GFX_SIZE
+        pal_off = CARD_PAL_BASE + gfx_index * CARD_PAL_SIZE
+        if gfx_off + CARD_GFX_SIZE > len(self.rom_data) or pal_off + CARD_PAL_SIZE > len(self.rom_data):
+            messagebox.showerror("Error", "Graphics/palette location out of ROM range.")
+            return
+
+        # --- Select PNG file ---
+        png_path = filedialog.askopenfilename(
+            title="Select card artwork PNG",
+            filetypes=[("PNG Images", "*.png"), ("All Files", "*.*")]
+        )
+        if not png_path:
+            return
+
+        try:
+            img = Image.open(png_path).convert("RGBA")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load image:\n{e}")
+            return
+
+        # --- Validate / resize to 80x80 ---
+        w, h = img.size
+        if w != h:
+            messagebox.showerror("Error", f"Image must be square. Got {w}x{h}.")
+            return
+
+        img = img.resize((80, 80), Image.LANCZOS)
+
+        # Flatten alpha onto a solid background (e.g. transparent→black)
+        # so quantization doesn't depend on PNG alpha weirdness.
+        bg = Image.new("RGB", (80, 80), (0, 0, 0))
+        bg.paste(img, mask=img.split()[3])  # use alpha channel as mask
+        img = bg  # now RGB
+
+        # --- Quantize to 64 colors ---
+        img = img.convert("P", palette=Image.ADAPTIVE, colors=64)
+
+        # --- Flip each 8x8 tile horizontally ---
+        pixels = img.load()
+        for ty in range(0, 80, 8):       # tile rows
+            for tx in range(0, 80, 8):   # tile columns
+                for y in range(8):
+                    for x in range(4):   # swap pairs within tile row
+                        x1 = tx + x
+                        x2 = tx + (7 - x)
+                        p1 = pixels[x1, ty + y]
+                        p2 = pixels[x2, ty + y]
+                        pixels[x1, ty + y] = p2
+                        pixels[x2, ty + y] = p1
+
+        # --- Run your custom gbagfx to generate 6bpp and palette ---
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_png = os.path.join(tmpdir, "card_in.png")
+            tmp_gfx = os.path.join(tmpdir, "card_in.6bpp")
+            tmp_pal = os.path.join(tmpdir, "card_in.gbapal")
+
+            img.save(tmp_png)
+
+            cmd = [
+                GBAGFX_PATH,
+                tmp_png,
+                tmp_gfx,
+                "-mwidth", "10",
+            ]
+
+            try:
+                res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except Exception as e:
+                messagebox.showerror("Error", f"gbagfx failed:\n{e}")
+                return
+            
+            cmd = [
+                GBAGFX_PATH,
+                tmp_png,
+                tmp_pal,
+            ]
+
+            try:
+                res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except Exception as e:
+                messagebox.showerror("Error", f"gbagfx failed:\n{e}")
+                return
+
+            # --- Read back 6bpp data + palette ---
+            try:
+                with open(tmp_gfx, "rb") as f:
+                    gfx_data = f.read()
+                with open(tmp_pal, "rb") as f:
+                    pal_data = f.read()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to read gbagfx output:\n{e}")
+                return
+
+        # Sanity checks
+        if len(gfx_data) != CARD_GFX_SIZE:
+            messagebox.showerror(
+                "Error",
+                f"6bpp data wrong size: expected {CARD_GFX_SIZE:#x}, got {len(gfx_data):#x}"
+            )
+            return
+
+        if len(pal_data) < CARD_PAL_SIZE:
+            messagebox.showerror(
+                "Error",
+                f"Palette data too small: need at least {CARD_PAL_SIZE:#x} bytes, got {len(pal_data):#x}"
+            )
+            return
+
+        # --- Write into ROM (only first 0x80 bytes of palette are used per entry) ---
+        self.rom_data[gfx_off:gfx_off + CARD_GFX_SIZE] = gfx_data
+        self.rom_data[pal_off:pal_off + CARD_PAL_SIZE] = pal_data[:CARD_PAL_SIZE]
+
+        messagebox.showinfo(
+            "Card graphics updated",
+            f"Updated graphics slot {gfx_index} at {hex(gfx_off)} and palette at {hex(pal_off)}."
+        )
+
+        # Optionally refresh your preview image, if you already have that hooked up
+        try:
+            # Replace this with whatever function you're using now to draw the card art
+            self._render_card_image(self.cards[self.current_index])
+        except Exception:
+            pass
+
     def _update_controls_state(self):
         state = tk.NORMAL if self.cards else tk.DISABLED
         self.prev_btn.config(state=state)
         self.next_btn.config(state=state)
         self.apply_btn.config(state=state)
+        if hasattr(self, "load_gfx_button"):
+            self.load_gfx_button.config(state=state)
         if not self.cards:
             self.name_entry.config(state=tk.DISABLED)
             self.desc_text.config(state=tk.DISABLED)
