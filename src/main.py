@@ -59,6 +59,27 @@ NUM_CARD_GFX = 2331            # total graphics slots
 # Path to gbagfx executable (adjust to where you keep it)
 GBAGFX_PATH = "deps/gbagfx"
 
+# =========================
+# CARD ICON CONSTANTS
+# =========================
+
+LARGE_ICON_BASE       = 0xFBC080   # 8bpp, 0x600 bytes per icon
+LARGE_ICON_SIZE       = 0x600
+
+SMALL_ICON_BASE       = 0x1326280  # 8bpp, 0x480 bytes per entry
+SMALL_ICON_ENTRY_SIZE = 0x480      # 0x240 regular + 0x240 sideways
+SMALL_ICON_SIZE       = 0x240      # bytes for *one* small icon
+
+ICON_PAL_BASE         = 0x510440   # shared icon palette
+ICON_PAL_SIZE         = 0x120      # 144 colors (0x120 bytes)
+
+# Dimensions (tweak if you confirm different sizes)
+LARGE_ICON_WIDTH  = 32
+LARGE_ICON_HEIGHT = 48  # 32 * 48 = 1536 = 0x600
+
+SMALL_ICON_WIDTH  = 24
+SMALL_ICON_HEIGHT = 24  # 24 * 24 = 576 = 0x240
+
 class ArtworkEntry:
     def __init__(self, index, unk_halfword, card_name_index):
         self.index = index                 # artwork slot index (0..2330)
@@ -435,6 +456,122 @@ class RomEditorApp(tk.Tk):
                 except Exception:
                     continue
         self.konami_name_map = mapping
+    
+    def _render_card_icons(self, card: CardEntry):
+        """
+        Render:
+          - large icon
+          - small regular icon
+          - small sideways icon
+
+        All are 8bpp indexed, using the shared palette at ICON_PAL_BASE.
+        Table indices are based on current_artwork_index (or card.artwork_id fallback).
+        """
+        # Clear by default
+        def clear_icons(msg=""):
+            self.large_icon_label.config(image="", text=msg or "(large)")
+            self.small_icon_label.config(image="", text=msg or "(small)")
+            self.small_side_icon_label.config(image="", text=msg or "(sideways)")
+            self.large_icon_photo = self.small_icon_photo = self.small_side_icon_photo = None
+
+        if self.rom_data is None:
+            clear_icons("(no ROM)")
+            return
+
+        icon_idx = self._get_gfx_index_from_current_artwork()
+        if icon_idx is None or icon_idx < 0:
+            clear_icons("(no icon)")
+            return
+
+        pal_data = self._get_icon_palette()
+        if pal_data is None:
+            clear_icons("(no palette)")
+            return
+
+        # Compute ROM offsets
+        large_off = LARGE_ICON_BASE + icon_idx * LARGE_ICON_SIZE
+        small_off = SMALL_ICON_BASE + icon_idx * SMALL_ICON_ENTRY_SIZE
+
+        if (large_off + LARGE_ICON_SIZE > len(self.rom_data) or
+            small_off + SMALL_ICON_ENTRY_SIZE > len(self.rom_data)):
+            clear_icons("(out of range)")
+            return
+
+        large_data = bytes(self.rom_data[large_off:large_off + LARGE_ICON_SIZE])
+        small_entry = bytes(self.rom_data[small_off:small_off + SMALL_ICON_ENTRY_SIZE])
+        small_reg_data = small_entry[:SMALL_ICON_SIZE]
+        small_side_data = small_entry[SMALL_ICON_SIZE:SMALL_ICON_ENTRY_SIZE]
+
+        # gbagfx expects a 256-color palette (0x200 bytes) for 8bpp; pad with zeros.
+        pal_256 = pal_data + b"\x00" * (0x200 - len(pal_data))
+
+        try:
+            self.large_icon_photo = self._decode_icon_to_photoimage(
+                large_data, pal_256, LARGE_ICON_WIDTH, LARGE_ICON_HEIGHT
+            )
+            self.small_icon_photo = self._decode_icon_to_photoimage(
+                small_reg_data, pal_256, SMALL_ICON_WIDTH, SMALL_ICON_HEIGHT
+            )
+            self.small_side_icon_photo = self._decode_icon_to_photoimage(
+                small_side_data, pal_256, SMALL_ICON_WIDTH, SMALL_ICON_HEIGHT
+            )
+        except Exception:
+            clear_icons("(decode error)")
+            return
+
+        # Attach to labels
+        self.large_icon_label.config(image=self.large_icon_photo, text="")
+        self.small_icon_label.config(image=self.small_icon_photo, text="")
+        self.small_side_icon_label.config(image=self.small_side_icon_photo, text="")
+
+    def _decode_icon_to_photoimage(self, gfx_data: bytes, pal_256: bytes,
+                                   width: int, height: int) -> ImageTk.PhotoImage:
+        """
+        Take raw 8bpp tile data + GBA-format palette and turn it into
+        a Tk PhotoImage via gbagfx + Pillow.
+        """
+        import tempfile, os
+
+        if len(gfx_data) != width * height:
+            # If this happens, your width/height constants are wrong.
+            raise ValueError("Icon size mismatch for given dimensions")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gfx_path = os.path.join(tmpdir, "icon.8bpp")
+            pal_path = os.path.join(tmpdir, "icon.gbapal")
+            png_path = os.path.join(tmpdir, "icon.png")
+
+            with open(gfx_path, "wb") as f:
+                f.write(gfx_data)
+            with open(pal_path, "wb") as f:
+                f.write(pal_256)
+
+            cmd = [
+                GBAGFX_PATH,
+                gfx_path,
+                png_path,
+                "-palette", pal_path,
+                "-mwidth", str(width / 8),
+            ]
+
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            img = Image.open(png_path)
+            # No flips/rotations here unless you *want* to adjust sideways icon visually.
+            return ImageTk.PhotoImage(img)
+
+    def _get_icon_palette(self):
+        if self.rom_data is None:
+            return None
+
+        if not hasattr(self, "_icon_palette_cache"):
+            if ICON_PAL_BASE + ICON_PAL_SIZE > len(self.rom_data):
+                self._icon_palette_cache = None
+            else:
+                self._icon_palette_cache = bytes(
+                    self.rom_data[ICON_PAL_BASE:ICON_PAL_BASE + ICON_PAL_SIZE]
+                )
+        return self._icon_palette_cache
 
     # =========================
     # UI SETUP
@@ -494,6 +631,27 @@ class RomEditorApp(tk.Tk):
         self.card_image_label = tk.Label(image_frame, text="(no art)")
         self.card_image_label.pack()
         self.card_photo = None  # keep reference to avoid GC
+
+                # --- Card icon previews ---
+        icon_frame = tk.LabelFrame(right_frame, text="Card Icons")
+        icon_frame.pack(anchor="center", pady=(5, 5), fill="x")
+
+        # Large icon
+        self.large_icon_label = tk.Label(icon_frame, text="(large)")
+        self.large_icon_label.grid(row=0, column=0, padx=4, pady=2)
+
+        # Small regular icon
+        self.small_icon_label = tk.Label(icon_frame, text="(small)")
+        self.small_icon_label.grid(row=0, column=1, padx=4, pady=2)
+
+        # Small sideways icon
+        self.small_side_icon_label = tk.Label(icon_frame, text="(sideways)")
+        self.small_side_icon_label.grid(row=0, column=2, padx=4, pady=2)
+
+        # Keep references so Tk doesn't GC the images
+        self.large_icon_photo = None
+        self.small_icon_photo = None
+        self.small_side_icon_photo = None
 
         # Name
         name_frame = tk.Frame(right_frame)
@@ -1261,12 +1419,13 @@ class RomEditorApp(tk.Tk):
         
         # --- NEW: sync Artwork tab to this card's Artwork # ---
         if self.artworks:
-            art_idx = card.card_id_index - 1
+            art_idx = card.card_id_index
             if 0 <= art_idx < len(self.artworks):
                 self._load_artwork_into_editor(art_idx)
 
         # --- NEW: render card artwork image ---
         self._render_card_image(card)
+        self._render_card_icons(card)
 
     def on_card_selected(self, event):
         if not self.cards or not self.filtered_indices:
@@ -1374,7 +1533,7 @@ class RomEditorApp(tk.Tk):
             return None
 
         # Prefer the artwork entry currently shown in the Artwork tab
-        art_idx = getattr(self, "current_artwork_index", None) + 1
+        art_idx = getattr(self, "current_artwork_index", None)
         if art_idx is None:
             # Fallback: use the primary Artwork # field for the current card
             if self.current_index is None:
