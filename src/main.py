@@ -808,6 +808,7 @@ class RomEditorApp(tk.Tk):
 
         # ---------- Type / race / attribute / stats ----------
         type_str = card_info.get("type") or ""
+        human_type_str = card_info.get("humanReadableCardType") or ""
         race_str = card_info.get("race") or ""
         attr_str = card_info.get("attribute") or ""
         atk_val = card_info.get("atk", card.atk)
@@ -815,6 +816,7 @@ class RomEditorApp(tk.Tk):
         lvl_val = card_info.get("level", card.level)
 
         type_str = str(type_str)
+        human_type_str = str(human_type_str)
         race_str = str(race_str)
         attr_str = str(attr_str)
 
@@ -849,6 +851,9 @@ class RomEditorApp(tk.Tk):
             card.level = 0
         else:
             # Monster (or other non-spell/trap types)
+            if human_type_str == 'Fusion Effect Monster':
+                type_str = human_type_str
+
             if type_str in self.types_list:
                 card.type_ = self.types_list.index(type_str)
 
@@ -869,6 +874,27 @@ class RomEditorApp(tk.Tk):
 
             if isinstance(lvl_val, int):
                 card.level = lvl_val & 0xFFFF
+
+        # ---------- SECONDARY: mirror primary stats ----------
+        # Only if this card actually has a secondary stats row
+        if card.second_stats_index >= 0:
+            # Usually you want secondary Konami / name index to follow primary
+            card.konami2 = card.konami_id
+            card.card_id_index2 = card.card_id_index
+
+            # Artwork + edited flag
+            card.artwork2 = card.artwork_id
+            card.edited_flag2 = card.edited_flag
+
+            # Stats (these already include your Spell/Trap + -1→65535 logic)
+            card.atk2 = card.atk
+            card.deff2 = card.deff
+            card.level2 = card.level
+            card.race2 = card.race
+            card.attribute2 = card.attribute
+            card.type2 = card.type_
+            card.st_race2 = card.st_race
+            card.padding2 = card.padding
 
         # ---------- Download cropped image and import graphics ----------
         image_url = None
