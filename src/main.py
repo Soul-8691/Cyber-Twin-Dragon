@@ -82,6 +82,12 @@ SMALL_ICON_HEIGHT = 24  # 24 * 24 = 576 = 0x240
 
 IMAGES_DIR = os.path.join(os.path.dirname(__file__), "../images")
 
+# Password & price tables (indexed by card name index)
+PASSWORD_TABLE_BASE = 0x15B94CC  # 4 bytes per card, little endian
+PRICE_TABLE_BASE    = 0x1CEDFA4  # 4 bytes per card, little endian
+PASSWORD_ENTRY_SIZE = 4
+PRICE_ENTRY_SIZE    = 4
+
 class ArtworkEntry:
     def __init__(self, index, unk_halfword, card_name_index):
         self.index = index                 # artwork slot index (0..2330)
@@ -98,7 +104,8 @@ class CardEntry:
         konami_id, card_id_index,
         artwork_id, edited_flag,
         atk, deff, level,
-        race, attribute, type_, st_race, padding
+        race, attribute, type_, st_race, padding,
+        password, price,          # <<< add these
     ):
         self.index = index
 
@@ -125,6 +132,10 @@ class CardEntry:
         self.type_ = type_
         self.st_race = st_race
         self.padding = padding
+
+        # Misc info
+        self.password = password  # 32-bit value, usually shown as 8-digit code
+        self.price    = price     # 32-bit value (shop price, etc.)
 
         # Secondary stats (filled later from second table)
         self.second_stats_index = -1  # which row in the 2648-entry second table we came from
@@ -789,9 +800,6 @@ class RomEditorApp(tk.Tk):
         self.info_label = tk.Label(right_frame, text="No ROM loaded.")
         self.info_label.pack(anchor="w", pady=(0, 5))
 
-        self.info_label = tk.Label(right_frame, text="No ROM loaded.")
-        self.info_label.pack(anchor="w", pady=(0, 5))
-
         # --- Card artwork + icons row ---
         art_row = tk.Frame(right_frame)
         art_row.pack(anchor="w", pady=(0, 5))
@@ -846,7 +854,7 @@ class RomEditorApp(tk.Tk):
 
         stats_notebook.add(stats_main_frame, text="Main Stats")
         stats_notebook.add(stats_sec_frame, text="Secondary Stats")
-        stats_notebook.add(artwork_frame, text="Artwork Table")
+        stats_notebook.add(artwork_frame, text="Misc Info")
 
         # MAIN stats vars
         self.konami_main_var = tk.IntVar()
@@ -881,6 +889,10 @@ class RomEditorApp(tk.Tk):
         self.artwork_unk_var = tk.StringVar()
         self.artwork_card_var = tk.StringVar()
         self.artwork_name_var = tk.StringVar()  # resolved artwork name from card_graphics_indexes.txt
+
+        # NEW: misc info vars
+        self.password_var = tk.StringVar()  # 8-digit password as string
+        self.price_var    = tk.IntVar()     # numeric price
 
         def add_numeric_row(frame, row, label, var, width=8):
             tk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=2, pady=1)
@@ -947,8 +959,22 @@ class RomEditorApp(tk.Tk):
         self.padding_sec_entry.grid(row=row, column=1, sticky="w", padx=2, pady=1)
         row += 1
 
-        # ---------- Artwork Table UI ----------
+        # ---------- Misc Info UI (password/price + artwork) ----------
         row = 0
+
+        # Password
+        tk.Label(artwork_frame, text="Password:").grid(row=row, column=0, sticky="w", padx=2, pady=1)
+        self.password_entry = tk.Entry(artwork_frame, textvariable=self.password_var, width=12)
+        self.password_entry.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+        row += 1
+
+        # Price
+        tk.Label(artwork_frame, text="Price:").grid(row=row, column=0, sticky="w", padx=2, pady=1)
+        self.price_entry = tk.Entry(artwork_frame, textvariable=self.price_var, width=12)
+        self.price_entry.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+        row += 1
+
+        # Existing artwork table controls follow
         tk.Label(artwork_frame, text="Unknown halfword:").grid(row=row, column=0, sticky="w", padx=2, pady=1)
         self.artwork_unk_combo = ttk.Combobox(
             artwork_frame,
@@ -976,7 +1002,7 @@ class RomEditorApp(tk.Tk):
             artwork_frame,
             text="Load Card Graphics...",
             command=self.load_card_graphics,
-            state=tk.DISABLED  # enabled once a ROM is loaded
+            state=tk.DISABLED
         )
         self.load_gfx_button.grid(row=row, column=0, columnspan=2, pady=(5, 0), sticky="w")
         row += 1
@@ -1140,6 +1166,29 @@ class RomEditorApp(tk.Tk):
 
             card_id_index = self._read_card_id_index_from_table(data, konami_id)
 
+            # --- NEW: password + price (4 bytes each, indexed by card name index) ---
+            pw_off = PASSWORD_TABLE_BASE + i * 4
+            pw_raw = data[pw_off:pw_off + 4]
+
+            # Reverse byte order
+            pw_raw = pw_raw[::-1]
+
+            digits = []
+            for b in pw_raw:
+                hi = (b >> 4) & 0xF
+                lo = b & 0xF
+                digits.append(str(hi if hi <= 9 else 0))
+                digits.append(str(lo if lo <= 9 else 0))
+
+            password = int("".join(digits))
+
+            price_off = PRICE_TABLE_BASE    + i * PRICE_ENTRY_SIZE
+
+            if price_off + 4 <= len(data):
+                price = int.from_bytes(data[price_off:price_off + 4], "little")
+            else:
+                price = 0
+
             card = CardEntry(
                 index=i,
                 name=name_str,
@@ -1161,7 +1210,9 @@ class RomEditorApp(tk.Tk):
                 attribute=attribute,
                 type_=type_,
                 st_race=st_race,
-                padding=padding
+                padding=padding,
+                password=password,      # <<< new
+                price=price,            # <<< new
             )
             cards.append(card)
 
@@ -1361,6 +1412,7 @@ class RomEditorApp(tk.Tk):
             self._write_stats_primary(rom_copy, card)
             self._write_stats_secondary(rom_copy, card)
             self._write_card_id_entry(rom_copy, card.konami_id, card.card_id_index)
+            self._write_password_and_price(rom_copy, card)   # <<< new
 
         # After all cards, write artwork table
         self._write_artwork_table(rom_copy)
@@ -1584,6 +1636,11 @@ class RomEditorApp(tk.Tk):
             if index < self.card_listbox.size():
                 self.card_listbox.selection_set(index)
                 self.card_listbox.see(index)
+
+        # --- Misc Info: password + price ---
+        # Show password as 8-digit zero-padded decimal (standard YGO style)
+        self.password_var.set(f"{card.password:08d}")
+        self.price_var.set(card.price)
         
         # --- NEW: sync Artwork tab to this card's Artwork # ---
         if self.artworks:
@@ -1605,6 +1662,33 @@ class RomEditorApp(tk.Tk):
         row = sel[0]
         idx = self.filtered_indices[row]
         self._load_card_into_editor(idx)
+
+    def _write_password_and_price(self, rom_data, card):
+        # ----- Password: 8-digit decimal → 4 BCD bytes -----
+        pw_off = PASSWORD_TABLE_BASE + card.index * PASSWORD_ENTRY_SIZE
+        pw_text = f"{card.password:08d}"
+        pw_bytes = bytearray()
+
+        # Build four bytes from the editor string (forward order)
+        for i in range(0, 8, 2):
+            hi = int(pw_text[i])
+            lo = int(pw_text[i + 1])
+            pw_bytes.append((hi << 4) | lo)
+
+        # Reverse *before writing to ROM*
+        pw_bytes = pw_bytes[::-1]
+
+        rom_data[pw_off:pw_off + 4] = pw_bytes
+
+        # ----- Price (still plain little-endian 32-bit) -----
+        price_off = PRICE_TABLE_BASE + card.index * PRICE_ENTRY_SIZE
+        if price_off + 4 <= len(rom_data):
+            rom_data[price_off:price_off + 4] = int(card.price & 0xFFFFFFFF).to_bytes(4, "little")
+
+        # Price
+        price_off = PRICE_TABLE_BASE + card.index * PRICE_ENTRY_SIZE
+        if price_off + 4 <= len(rom_data):
+            rom_data[price_off:price_off + 4] = int(card.price & 0xFFFFFFFF).to_bytes(4, "little")
 
     def _write_artwork_table(self, rom_data):
         for entry in self.artworks:
@@ -1668,6 +1752,26 @@ class RomEditorApp(tk.Tk):
         card.attribute2 = get_index_from_combo(self.attribute_sec_combo, self.attributes_list, self.attribute_sec_var)
         card.type2 = get_index_from_combo(self.type_sec_combo, self.types_list, self.type_sec_var)
         card.st_race2 = get_index_from_combo(self.st_race_sec_combo, self.st_races_list, self.st_race_sec_var)
+
+        # --- Misc Info from UI back into card ---
+        pw_text = self.password_var.get().strip()
+        if pw_text:
+            # Accept only digits; keep old value on bad input
+            try:
+                pw_val = int(pw_text)
+            except ValueError:
+                pw_val = card.password
+        else:
+            pw_val = 0
+
+        card.password = pw_val & 0xFFFFFFFF  # clamp to 32-bit
+
+        try:
+            price_val = int(self.price_var.get())
+        except (ValueError, tk.TclError):
+            price_val = card.price
+
+        card.price = price_val & 0xFFFFFFFF
 
         # Refresh dropdown labels after renames
         self._update_card_id_choices()
