@@ -1905,29 +1905,32 @@ class RomEditorApp(tk.Tk):
     def _write_u32(data, offset, value):
         data[offset:offset + 4] = int(value & 0xFFFFFFFF).to_bytes(4, "little")
 
-    def _find_free_space_ff(self, rom_data, size):
+    def _find_free_space_ff(self, rom_data, size, alignment=4):
         """
-        Find a run of 0xFF bytes of at least 'size' anywhere in the ROM.
-        Used for repointing decks when they expand.
+        Find a run of 0xFF bytes of at least 'size' **starting at an aligned offset**.
+
+        alignment=4 means offsets end in 0, 4, 8, or C (4-byte aligned).
         """
         if size <= 0:
             return None
+        if alignment <= 0:
+            alignment = 1
 
-        run_start = None
-        run_len = 0
         end = len(rom_data)
-        for addr in range(FREE_SPACE_START, end):
-            if rom_data[addr] == 0xFF:
-                if run_start is None:
-                    run_start = addr
-                    run_len = 1
-                else:
-                    run_len += 1
-                if run_len >= size:
-                    return run_start
-            else:
-                run_start = None
-                run_len = 0
+        # Start from the first aligned offset
+        addr = FREE_SPACE_START
+        if addr % alignment != 0:
+            addr += alignment - (addr % alignment)
+
+        while addr + size <= end:
+            # Check this aligned candidate
+            chunk = rom_data[addr:addr + size]
+            if chunk and all(b == 0xFF for b in chunk):
+                return addr
+
+            # Move to the next aligned candidate
+            addr += alignment
+
         return None
 
     @staticmethod
