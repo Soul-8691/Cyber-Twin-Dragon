@@ -8,6 +8,8 @@ from PIL import Image, ImageTk
 import subprocess
 import tempfile
 import traceback
+from io import BytesIO
+from urllib.request import urlopen
 
 # =========================
 # CONSTANTS FOR THIS ROM
@@ -175,6 +177,8 @@ class RomEditorApp(tk.Tk):
 
         # YGOPRODeck Konami ID -> name
         self.konami_name_map = {}
+        self.ygo_cards_by_name = {}
+        self.ygo_card_names = []
 
         # Trace guards
         self._updating_konami_main = False
@@ -611,6 +615,8 @@ class RomEditorApp(tk.Tk):
         json_path = os.path.join(base_dir, "..", "json", "ygoprodeck_card_info.json")
         if not os.path.isfile(json_path):
             self.konami_name_map = {}
+            self.ygo_cards_by_name = {}
+            self.ygo_card_names = []
             return
 
         try:
@@ -618,23 +624,38 @@ class RomEditorApp(tk.Tk):
                 data = json.load(f)
         except Exception:
             self.konami_name_map = {}
+            self.ygo_cards_by_name = {}
+            self.ygo_card_names = []
             return
 
         mapping = {}
+        ygo_by_name = {}
+        ygo_names = []
+
         if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
             for card_info in data["data"]:
                 try:
+                    # YGOPRODeck piece used for Konami->name (you already had this)
                     misc = card_info.get("misc_info")
-                    if not misc or not isinstance(misc, list):
-                        continue
-                    konami_id = misc[0].get("konami_id")
+                    if misc and isinstance(misc, list):
+                        konami_id = misc[0].get("konami_id")
+                        name = card_info.get("name")
+                        if isinstance(konami_id, int) and isinstance(name, str):
+                            mapping[konami_id] = name
+
+                    # NEW: keep full card info and names for dropdown
                     name = card_info.get("name")
-                    if isinstance(konami_id, int) and isinstance(name, str):
-                        mapping[konami_id] = name
+                    if isinstance(name, str):
+                        if name not in ygo_by_name:
+                            ygo_by_name[name] = card_info
+                            ygo_names.append(name)
                 except Exception:
                     continue
+
         self.konami_name_map = mapping
-    
+        self.ygo_cards_by_name = ygo_by_name
+        self.ygo_card_names = sorted(ygo_names, key=str.lower)
+
     def _render_card_icons(self, card: CardEntry):
         """
         Render:
@@ -738,6 +759,292 @@ class RomEditorApp(tk.Tk):
             # No flips/rotations here unless you *want* to adjust sideways icon visually.
             return ImageTk.PhotoImage(img)
 
+    def import_from_ygoprodeck(self):
+        if self.rom_data is None or not self.cards:
+            messagebox.showinfo("No ROM", "Load a ROM first.")
+            return
+        if self.current_index is None:
+            messagebox.showinfo("No card selected", "Select a card first.")
+            return
+
+        name = (self.ygo_import_var.get() or "").strip()
+        if not name:
+            messagebox.showinfo("No YGOPRODeck card", "Choose a card from the dropdown first.")
+            return
+
+        if not hasattr(self, "ygo_cards_by_name") or name not in self.ygo_cards_by_name:
+            # Try case-insensitive match
+            lowered = name.lower()
+            match = None
+            for n, ci in self.ygo_cards_by_name.items():
+                if n.lower() == lowered:
+                    match = ci
+                    break
+            if match is None:
+                messagebox.showerror("Error", f"No YGOPRODeck entry found for '{name}'.")
+                return
+            card_info = match
+        else:
+            card_info = self.ygo_cards_by_name[name]
+
+        card = self.cards[self.current_index]
+
+        # ---------- Basic text + password ----------
+        card_name = card_info.get("name") or card.name
+        desc = card_info.get("desc") or card.desc
+        ygo_id = card_info.get("id")
+
+        card.name = card_name
+        card.desc = desc
+
+        # Password: YGOPRODeck 'id' is numeric; we treat it as the decimal password
+        try:
+            if isinstance(ygo_id, int):
+                card.password = ygo_id
+            elif isinstance(ygo_id, str) and ygo_id.isdigit():
+                card.password = int(ygo_id)
+        except Exception:
+            pass  # fall back to existing value if something weird happens
+
+        # ---------- Type / race / attribute / stats ----------
+        type_str = card_info.get("type") or ""
+        race_str = card_info.get("race") or ""
+        attr_str = card_info.get("attribute") or ""
+        atk_val = card_info.get("atk", card.atk)
+        def_val = card_info.get("def", card.deff)
+        lvl_val = card_info.get("level", card.level)
+
+        type_str = str(type_str)
+        race_str = str(race_str)
+        attr_str = str(attr_str)
+
+        is_spell = type_str == "Spell Card"
+        is_trap = type_str == "Trap Card"
+
+        if is_spell or is_trap:
+            # Spell / Trap: Race, Attribute, and Type are all Spell/Trap Card,
+            # with ATK/DEF/Level set to 0. Spell/Trap race from YGOPRO 'race'.
+            base_type_name = "Spell Card" if is_spell else "Trap Card"
+
+            # Type
+            if base_type_name in self.types_list:
+                card.type_ = self.types_list.index(base_type_name)
+
+            # Race (monster race field)
+            if base_type_name in self.races_list:
+                card.race = self.races_list.index(base_type_name)
+
+            # Attribute
+            if base_type_name in self.attributes_list:
+                card.attribute = self.attributes_list.index(base_type_name)
+
+            # Spell/Trap Race (Normal, Continuous, Equip, etc.)
+            if race_str in self.st_races_list:
+                card.st_race = self.st_races_list.index(race_str)
+            else:
+                card.st_race = 0
+
+            card.atk = 0
+            card.deff = 0
+            card.level = 0
+        else:
+            # Monster (or other non-spell/trap types)
+            if type_str in self.types_list:
+                card.type_ = self.types_list.index(type_str)
+
+            if race_str in self.races_list:
+                card.race = self.races_list.index(race_str)
+
+            if attr_str in self.attributes_list:
+                card.attribute = self.attributes_list.index(attr_str)
+
+            # Not a spell/trap, so spell/trap race is 0
+            card.st_race = 0
+
+            # ATK / DEF: -1 means "?" → 65535 in the ROM
+            if isinstance(atk_val, int):
+                card.atk = 65535 if atk_val == -1 else max(0, atk_val) & 0xFFFF
+            if isinstance(def_val, int):
+                card.deff = 65535 if def_val == -1 else max(0, def_val) & 0xFFFF
+
+            if isinstance(lvl_val, int):
+                card.level = lvl_val & 0xFFFF
+
+        # ---------- Download cropped image and import graphics ----------
+        image_url = None
+        images = card_info.get("card_images") or []
+        if isinstance(images, list) and images:
+            first_img = images[0] or {}
+            image_url = first_img.get("image_url_cropped") or first_img.get("image_url")
+
+        if image_url:
+            try:
+                resp = urlopen(image_url)
+                data = resp.read()
+                pil_img = Image.open(BytesIO(data))
+                # Use the same pipeline as your "Load Card Graphics..." feature
+                self._import_card_graphics_from_pil(card, pil_img)
+            except Exception as e:
+                messagebox.showerror("Image Error", f"Failed to download or import card image:\n{e}")
+
+        # Refresh UI from updated CardEntry
+        self._load_card_into_editor(self.current_index)
+
+    def _import_card_graphics_from_pil(self, card, pil_img):
+        """
+        Shared pipeline to take any PIL image and:
+          - resize to 80x80
+          - do your existing JPG->PNG / alpha / 64-color card art conversion
+          - import the main card graphic (6bpp + palette)
+          - generate/update icons (large + 2 small) using your templates
+        """
+        # This is basically the body of your existing load_card_graphics method,
+        # but starting from a PIL image instead of a file path.
+
+        # Example sketch (adapt to your current implementation):
+        img = pil_img.convert("RGBA")
+
+        # --- Validate / resize to 80x80 ---
+        w, h = img.size
+        if w != h:
+            messagebox.showerror("Error", f"Image must be square. Got {w}x{h}.")
+            return
+
+        img = img.resize((80, 80), Image.LANCZOS)
+
+        # Flatten alpha onto a solid background (e.g. transparent→black)
+        # so quantization doesn't depend on PNG alpha weirdness.
+        bg = Image.new("RGB", (80, 80), (0, 0, 0))
+        bg.paste(img, mask=img.split()[3])  # use alpha channel as mask
+        
+        # This is the “master” card image for icons
+        card_rgb_80 = bg.copy()
+        
+        img = bg  # now RGB
+
+        # --- Quantize to 64 colors ---
+        img = img.convert("P", palette=Image.ADAPTIVE, colors=64)
+
+        # --- Flip each 8x8 tile horizontally ---
+        pixels = img.load()
+        for ty in range(0, 80, 8):       # tile rows
+            for tx in range(0, 80, 8):   # tile columns
+                for y in range(8):
+                    for x in range(4):   # swap pairs within tile row
+                        x1 = tx + x
+                        x2 = tx + (7 - x)
+                        p1 = pixels[x1, ty + y]
+                        p2 = pixels[x2, ty + y]
+                        pixels[x1, ty + y] = p2
+                        pixels[x2, ty + y] = p1
+
+        # --- Run your custom gbagfx to generate 6bpp and palette ---
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_png = os.path.join(tmpdir, "card_in.png")
+            tmp_gfx = os.path.join(tmpdir, "card_in.6bpp")
+            tmp_pal = os.path.join(tmpdir, "card_in.gbapal")
+
+            img.save(tmp_png)
+
+            cmd = [
+                GBAGFX_PATH,
+                tmp_png,
+                tmp_gfx,
+                "-mwidth", "10",
+            ]
+
+            try:
+                res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except Exception as e:
+                messagebox.showerror("Error", f"gbagfx failed:\n{e}")
+                return
+            
+            cmd = [
+                GBAGFX_PATH,
+                tmp_png,
+                tmp_pal,
+            ]
+
+            try:
+                res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except Exception as e:
+                messagebox.showerror("Error", f"gbagfx failed:\n{e}")
+                return
+
+            # --- Read back 6bpp data + palette ---
+            try:
+                with open(tmp_gfx, "rb") as f:
+                    gfx_data = f.read()
+                with open(tmp_pal, "rb") as f:
+                    pal_data = f.read()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to read gbagfx output:\n{e}")
+                return
+
+        # Sanity checks
+        if len(gfx_data) != CARD_GFX_SIZE:
+            messagebox.showerror(
+                "Error",
+                f"6bpp data wrong size: expected {CARD_GFX_SIZE:#x}, got {len(gfx_data):#x}"
+            )
+            return
+
+        if len(pal_data) < CARD_PAL_SIZE:
+            messagebox.showerror(
+                "Error",
+                f"Palette data too small: need at least {CARD_PAL_SIZE:#x} bytes, got {len(pal_data):#x}"
+            )
+            return
+        
+        gfx_index = self._get_gfx_index_from_current_artwork()
+        if gfx_index is None:
+            messagebox.showerror("Error", "Could not resolve Card (Name Index) / graphics index.")
+            return
+
+        if not (0 <= gfx_index < NUM_CARD_GFX):
+            messagebox.showerror("Error", f"Graphics index {gfx_index} is out of range.")
+            return
+
+        gfx_off = CARD_GFX_BASE + gfx_index * CARD_GFX_SIZE
+        pal_off = CARD_PAL_BASE + gfx_index * CARD_PAL_SIZE
+        if gfx_off + CARD_GFX_SIZE > len(self.rom_data) or pal_off + CARD_PAL_SIZE > len(self.rom_data):
+            messagebox.showerror("Error", "Graphics/palette location out of ROM range.")
+            return
+
+        # --- Write into ROM (only first 0x80 bytes of palette are used per entry) ---
+        self.rom_data[gfx_off:gfx_off + CARD_GFX_SIZE] = gfx_data
+        self.rom_data[pal_off:pal_off + CARD_PAL_SIZE] = pal_data[:CARD_PAL_SIZE]
+
+        messagebox.showinfo(
+            "Card graphics updated",
+            f"Updated graphics slot {gfx_index} at {hex(gfx_off)} and palette at {hex(pal_off)}."
+        )
+
+        # After writing gfx/pal for the main 6bpp artwork:
+        card = self.cards[self.current_index]
+        self._import_icons_from_card_image(card, card_rgb_80)
+
+        # Optionally refresh your preview image, if you already have that hooked up
+        try:
+            # Replace this with whatever function you're using now to draw the card art
+            self._render_card_image(card)
+            self._render_card_icons(card)
+        except Exception:
+            pass
+
+    def _on_ygo_import_filter(self, event):
+        """Filter YGOPRODeck combo by substring in name."""
+        if not hasattr(self, "ygo_card_names"):
+            return
+        pattern = self.ygo_import_var.get().lower()
+        if not pattern:
+            filtered = self.ygo_card_names
+        else:
+            filtered = [n for n in self.ygo_card_names if pattern in n.lower()]
+        self.ygo_import_combo["values"] = filtered
+        # Optional: expand dropdown as you type
+        # self.ygo_import_combo.event_generate("<Down>")
+
     def _get_icon_palette(self):
         if self.rom_data is None:
             return None
@@ -836,6 +1143,31 @@ class RomEditorApp(tk.Tk):
         self.name_var = tk.StringVar()
         self.name_entry = tk.Entry(name_frame, textvariable=self.name_var)
         self.name_entry.pack(fill=tk.X)
+
+        # YGOPRODeck import
+        import_frame = tk.Frame(right_frame)
+        import_frame.pack(fill=tk.X, pady=(2, 0))
+
+        tk.Label(import_frame, text="Import from YGOPRODeck:").pack(side=tk.LEFT)
+
+        self.ygo_import_var = tk.StringVar()
+        self.ygo_import_combo = ttk.Combobox(
+            import_frame,
+            textvariable=self.ygo_import_var,
+            width=30
+        )
+        # All card names from the JSON
+        self.ygo_import_combo["values"] = self.ygo_card_names
+        self.ygo_import_combo.pack(side=tk.LEFT, padx=(3, 3))
+
+        # Filter as you type
+        self.ygo_import_combo.bind("<KeyRelease>", self._on_ygo_import_filter)
+
+        tk.Button(
+            import_frame,
+            text="Import",
+            command=self.import_from_ygoprodeck
+        ).pack(side=tk.LEFT)
 
         # Description
         desc_frame = tk.Frame(right_frame)
@@ -1188,6 +1520,12 @@ class RomEditorApp(tk.Tk):
                 price = int.from_bytes(data[price_off:price_off + 4], "little")
             else:
                 price = 0
+            
+            gfx_off = CARD_GFX_BASE + card_id_index * CARD_GFX_SIZE
+            pal_off = CARD_PAL_BASE + card_id_index * CARD_PAL_SIZE
+            if gfx_off + CARD_GFX_SIZE > len(self.rom_data) or pal_off + CARD_PAL_SIZE > len(self.rom_data):
+                messagebox.showerror("Error", "Graphics/palette location out of ROM range.")
+                return
 
             card = CardEntry(
                 index=i,
@@ -1888,21 +2226,6 @@ class RomEditorApp(tk.Tk):
             messagebox.showinfo("No card selected", "Select a card first.")
             return
 
-        gfx_index = self._get_gfx_index_from_current_artwork()
-        if gfx_index is None:
-            messagebox.showerror("Error", "Could not resolve Card (Name Index) / graphics index.")
-            return
-
-        if not (0 <= gfx_index < NUM_CARD_GFX):
-            messagebox.showerror("Error", f"Graphics index {gfx_index} is out of range.")
-            return
-
-        gfx_off = CARD_GFX_BASE + gfx_index * CARD_GFX_SIZE
-        pal_off = CARD_PAL_BASE + gfx_index * CARD_PAL_SIZE
-        if gfx_off + CARD_GFX_SIZE > len(self.rom_data) or pal_off + CARD_PAL_SIZE > len(self.rom_data):
-            messagebox.showerror("Error", "Graphics/palette location out of ROM range.")
-            return
-
         # --- Select PNG file ---
         img_path = filedialog.askopenfilename(
             title="Select card artwork PNG",
@@ -1926,118 +2249,8 @@ class RomEditorApp(tk.Tk):
             messagebox.showerror("Error", f"Failed to load image:\n{e}")
             return
 
-        # --- Validate / resize to 80x80 ---
-        w, h = img.size
-        if w != h:
-            messagebox.showerror("Error", f"Image must be square. Got {w}x{h}.")
-            return
-
-        img = img.resize((80, 80), Image.LANCZOS)
-
-        # Flatten alpha onto a solid background (e.g. transparent→black)
-        # so quantization doesn't depend on PNG alpha weirdness.
-        bg = Image.new("RGB", (80, 80), (0, 0, 0))
-        bg.paste(img, mask=img.split()[3])  # use alpha channel as mask
-        
-        # This is the “master” card image for icons
-        card_rgb_80 = bg.copy()
-        
-        img = bg  # now RGB
-
-        # --- Quantize to 64 colors ---
-        img = img.convert("P", palette=Image.ADAPTIVE, colors=64)
-
-        # --- Flip each 8x8 tile horizontally ---
-        pixels = img.load()
-        for ty in range(0, 80, 8):       # tile rows
-            for tx in range(0, 80, 8):   # tile columns
-                for y in range(8):
-                    for x in range(4):   # swap pairs within tile row
-                        x1 = tx + x
-                        x2 = tx + (7 - x)
-                        p1 = pixels[x1, ty + y]
-                        p2 = pixels[x2, ty + y]
-                        pixels[x1, ty + y] = p2
-                        pixels[x2, ty + y] = p1
-
-        # --- Run your custom gbagfx to generate 6bpp and palette ---
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_png = os.path.join(tmpdir, "card_in.png")
-            tmp_gfx = os.path.join(tmpdir, "card_in.6bpp")
-            tmp_pal = os.path.join(tmpdir, "card_in.gbapal")
-
-            img.save(tmp_png)
-
-            cmd = [
-                GBAGFX_PATH,
-                tmp_png,
-                tmp_gfx,
-                "-mwidth", "10",
-            ]
-
-            try:
-                res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except Exception as e:
-                messagebox.showerror("Error", f"gbagfx failed:\n{e}")
-                return
-            
-            cmd = [
-                GBAGFX_PATH,
-                tmp_png,
-                tmp_pal,
-            ]
-
-            try:
-                res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except Exception as e:
-                messagebox.showerror("Error", f"gbagfx failed:\n{e}")
-                return
-
-            # --- Read back 6bpp data + palette ---
-            try:
-                with open(tmp_gfx, "rb") as f:
-                    gfx_data = f.read()
-                with open(tmp_pal, "rb") as f:
-                    pal_data = f.read()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to read gbagfx output:\n{e}")
-                return
-
-        # Sanity checks
-        if len(gfx_data) != CARD_GFX_SIZE:
-            messagebox.showerror(
-                "Error",
-                f"6bpp data wrong size: expected {CARD_GFX_SIZE:#x}, got {len(gfx_data):#x}"
-            )
-            return
-
-        if len(pal_data) < CARD_PAL_SIZE:
-            messagebox.showerror(
-                "Error",
-                f"Palette data too small: need at least {CARD_PAL_SIZE:#x} bytes, got {len(pal_data):#x}"
-            )
-            return
-
-        # --- Write into ROM (only first 0x80 bytes of palette are used per entry) ---
-        self.rom_data[gfx_off:gfx_off + CARD_GFX_SIZE] = gfx_data
-        self.rom_data[pal_off:pal_off + CARD_PAL_SIZE] = pal_data[:CARD_PAL_SIZE]
-
-        messagebox.showinfo(
-            "Card graphics updated",
-            f"Updated graphics slot {gfx_index} at {hex(gfx_off)} and palette at {hex(pal_off)}."
-        )
-
-        # After writing gfx/pal for the main 6bpp artwork:
         card = self.cards[self.current_index]
-        self._import_icons_from_card_image(card, card_rgb_80)
-
-        # Optionally refresh your preview image, if you already have that hooked up
-        try:
-            # Replace this with whatever function you're using now to draw the card art
-            self._render_card_image(card)
-            self._render_card_icons(card)
-        except Exception:
-            pass
+        self._import_card_graphics_from_pil(card, img)
 
     def _update_controls_state(self):
         state = tk.NORMAL if self.cards else tk.DISABLED
