@@ -95,7 +95,14 @@ DECK_PTR_TABLE_BASE = 0x1E63BEC  # 4-byte little-endian pointers, ROM-address (0
 DECK_PTR_ENTRY_SIZE = 4
 GBA_ROM_BASE        = 0x08000000  # for converting ROM addresses -> file offsets
 NUM_DECKS           = 215
-FREE_SPACE_START    = 0x162248B
+FREE_SPACE_START    = 0x162248C
+
+# =========================
+# PACK CONSTANTS
+# =========================
+PACK_TABLE_BASE   = 0x1E5E2E8  # pack structs
+PACK_ENTRY_SIZE   = 0x10       # 16 bytes per pack
+NUM_PACKS         = 45         # total packs
 
 class ArtworkEntry:
     def __init__(self, index, unk_halfword, card_name_index):
@@ -113,6 +120,26 @@ class DeckEntry:
         self.main_cards = list(main_cards)  # list of Konami IDs (u16)
         self.extra_cards = list(extra_cards)
         self.original_size = original_size  # bytes originally allocated
+
+class PackEntry:
+    def __init__(self, index, struct_off, ptr_off,
+                 cost, cards_per_pack, card_amount,
+                 unk0, unk1, padding,
+                 contents_off, contents, original_contents_size):
+        self.index = index               # pack index (0..NUM_PACKS-1)
+        self.struct_off = struct_off     # offset of pack header in ROM
+        self.ptr_off = ptr_off           # offset of contents pointer (struct_off + 12)
+        self.cost = cost
+        self.cards_per_pack = cards_per_pack
+        self.card_amount = card_amount
+        self.unk0 = unk0
+        self.unk1 = unk1
+        self.padding = padding
+
+        # contents: list of (konami_id, rarity_index)
+        self.contents_off = contents_off
+        self.contents = list(contents)
+        self.original_contents_size = original_contents_size  # bytes
 
 class CardEntry:
     def __init__(
@@ -216,10 +243,59 @@ class RomEditorApp(tk.Tk):
         self.deck_names = []  # index -> name from text/decks.txt
 
         self.password_to_konami = {}  # password (int) -> konami_id
+        
+        self.packs = []          # list[PackEntry]
+        self.pack_names = []     # from text/packs.txt
+        self.rarities = []       # from text/rarities.txt
 
         self._load_text_mappings()
         self._load_json_mappings()
         self._build_ui()
+
+    def _load_rarities(self):
+        """
+        Load rarities from text/rarities.txt: one per line.
+        The line index is the rarity index stored in ROM.
+        """
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base_dir = os.getcwd()
+
+        path = os.path.join(base_dir, "..", "text", "rarities.txt")
+        rarities = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    rarities.append(line.strip())
+        except Exception:
+            rarities = []
+
+        if not rarities:
+            rarities = ["(None)"]
+
+        self.rarities = rarities
+
+    def _load_pack_names(self):
+        """
+        Load pack names from text/packs.txt.
+        Each line corresponds to a pack index.
+        """
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base_dir = os.getcwd()
+
+        path = os.path.join(base_dir, "..", "text", "packs.txt")
+        names = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    names.append(line.strip())
+        except Exception:
+            names = []
+
+        self.pack_names = names
 
     def _write_deck_to_rom(self, deck: DeckEntry):
         """
@@ -1186,6 +1262,14 @@ class RomEditorApp(tk.Tk):
             self._parse_decks()
         DeckEditorWindow(self)
 
+    def open_pack_editor(self):
+        if self.rom_data is None or not self.cards:
+            messagebox.showinfo("No ROM", "Load a ROM first.")
+            return
+        if not self.packs:
+            self._parse_packs()
+        PackEditorWindow(self)
+
     # =========================
     # UI SETUP
     # =========================
@@ -1203,7 +1287,8 @@ class RomEditorApp(tk.Tk):
         # Deck menu
         deck_menu = tk.Menu(menubar, tearoff=False)
         deck_menu.add_command(label="Deck Editor...", command=self.open_deck_editor)
-        menubar.add_cascade(label="Decks", menu=deck_menu)
+        deck_menu.add_command(label="Pack Editor...", command=self.open_pack_editor)
+        menubar.add_cascade(label="Other Editors", menu=deck_menu)
 
         self.config(menu=menubar)
 
@@ -1586,6 +1671,138 @@ class RomEditorApp(tk.Tk):
         buf += b"\x00\x00"  # terminator
         return bytes(buf)
 
+    def _parse_packs(self):
+        """
+        Parse all packs from PACK_TABLE_BASE.
+        """
+        self.packs = []
+        if self.rom_data is None:
+            return
+
+        data = self.rom_data
+        for i in range(NUM_PACKS):
+            struct_off = PACK_TABLE_BASE + i * PACK_ENTRY_SIZE
+            if struct_off + PACK_ENTRY_SIZE > len(data):
+                break
+
+            cost           = self._read_u16(data, struct_off + 0)
+            cards_per_pack = self._read_u16(data, struct_off + 2)
+            card_amount    = self._read_u16(data, struct_off + 4)
+            unk0           = self._read_u16(data, struct_off + 6)
+            unk1           = self._read_u16(data, struct_off + 8)
+            padding        = self._read_u16(data, struct_off + 10)
+            ptr_val        = self._read_u32(data, struct_off + 12)
+            ptr_off        = struct_off + 12
+
+            if ptr_val == 0 or ptr_val == 0xFFFFFFFF:
+                contents_off = -1
+                contents = []
+                original_size = 0
+            else:
+                contents_off = ptr_val - GBA_ROM_BASE
+                contents = []
+                original_size = 0
+
+                if 0 <= contents_off < len(data):
+                    pos = contents_off
+                    for _ in range(card_amount):
+                        if pos + 4 > len(data):
+                            break
+                        kid = self._read_u16(data, pos)
+                        rar = self._read_u16(data, pos + 2)
+                        contents.append((kid, rar))
+                        pos += 4
+                    original_size = pos - contents_off
+                else:
+                    contents_off = -1
+
+            pack = PackEntry(
+                index=i,
+                struct_off=struct_off,
+                ptr_off=ptr_off,
+                cost=cost,
+                cards_per_pack=cards_per_pack,
+                card_amount=card_amount,
+                unk0=unk0,
+                unk1=unk1,
+                padding=padding,
+                contents_off=contents_off,
+                contents=contents,
+                original_contents_size=original_size,
+            )
+            self.packs.append(pack)
+
+    def _encode_pack_contents(self, pack: PackEntry) -> bytes:
+        """
+        Encode pack contents: [ (konami_id, rarity) * cards_per_pack ]
+        Each entry is 4 bytes: 2-byte Konami ID, 2-byte rarity index.
+        """
+        buf = bytearray()
+        for i in range(pack.card_amount):
+            if i < len(pack.contents):
+                kid, rar = pack.contents[i]
+            else:
+                kid, rar = 0, 0
+            buf += int(kid & 0xFFFF).to_bytes(2, "little")
+            buf += int(rar & 0xFFFF).to_bytes(2, "little")
+        return bytes(buf)
+
+    def _write_pack_to_rom(self, pack: PackEntry):
+        """
+        Write a PackEntry to self.rom_data.
+        Handles repointing contents if size grows beyond original.
+        """
+        if self.rom_data is None:
+            return
+
+        rom = self.rom_data
+
+        # --- header ---
+        off = pack.struct_off
+        self._write_u16(rom, off + 0,  pack.cost & 0xFFFF)
+        self._write_u16(rom, off + 2,  pack.cards_per_pack & 0xFFFF)
+        self._write_u16(rom, off + 4,  pack.card_amount & 0xFFFF)
+        self._write_u16(rom, off + 6,  pack.unk0 & 0xFFFF)
+        self._write_u16(rom, off + 8,  pack.unk1 & 0xFFFF)
+        self._write_u16(rom, off + 10, pack.padding & 0xFFFF)
+
+        contents_blob = self._encode_pack_contents(pack)
+        new_size = len(contents_blob)
+
+        # contents_off may be -1 if pointer was invalid; treat as needing new space
+        need_new_space = pack.contents_off < 0 or new_size > pack.original_contents_size
+
+        if not need_new_space:
+            # write in place
+            write_off = pack.contents_off
+            rom[write_off:write_off + new_size] = contents_blob
+            # Optional: clear leftover
+            leftover = pack.original_contents_size - new_size
+            if leftover > 0:
+                rom[write_off + new_size:write_off + pack.original_contents_size] = b"\xFF" * leftover
+        else:
+            # find new FF space
+            new_off = self._find_free_space_ff(rom, new_size)
+            if new_off is None:
+                messagebox.showerror("Pack Editor", f"No free space for pack {pack.index}.")
+                return
+
+            # free old region if valid
+            if pack.contents_off >= 0 and pack.original_contents_size > 0:
+                rom[pack.contents_off:pack.contents_off + pack.original_contents_size] = (
+                    b"\xFF" * pack.original_contents_size
+                )
+
+            # write new
+            rom[new_off:new_off + new_size] = contents_blob
+
+            # update pointer
+            new_ptr_val = new_off + GBA_ROM_BASE
+            self._write_u32(rom, pack.ptr_off, new_ptr_val)
+
+            pack.contents_off = new_off
+            pack.original_contents_size = new_size
+
     # =========================
     # ROM HANDLING
     # =========================
@@ -1619,7 +1836,9 @@ class RomEditorApp(tk.Tk):
         self._update_card_id_choices()
         self._build_deck_card_choices()
         self._load_deck_names()
-        self._parse_decks()
+        self._load_rarities()
+        self._load_pack_names()
+        self._parse_packs()
         self.current_index = 0
         self.clear_filter()
         self._load_card_into_editor(0)
@@ -2643,6 +2862,293 @@ class RomEditorApp(tk.Tk):
         # using the YGOPRODeck mapping.
         self._set_card_id_ui(self.card_id_sec_var, idx_val, konami2)
 
+class PackEditorWindow(tk.Toplevel):
+    def __init__(self, app: RomEditorApp):
+        super().__init__(app)
+        self.app = app
+        self.title("Yu-Gi-Oh! UM 2006 – Pack Editor")
+
+        self.packs = app.packs
+        self.current_pack_index = 0
+
+        # Header vars
+        self.cost_var = tk.IntVar()
+        self.cards_per_pack_var = tk.IntVar()
+        self.card_amount_var = tk.IntVar()
+        self.unk0_var = tk.StringVar()
+        self.unk1_var = tk.StringVar()
+        self.padding_var = tk.StringVar()
+
+        # Contents vars
+        self.card_vars = []    # list[StringVar] for Konami IDs (dropdown labels)
+        self.rarity_vars = []  # list[StringVar] rarity names
+
+        self._build_ui()
+        if self.packs:
+            self._load_pack_into_editor(0)
+
+    def _on_pack_selected(self, event):
+        sel = self.pack_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self._apply_ui_to_pack()
+        self._load_pack_into_editor(idx)
+
+    def _load_pack_into_editor(self, idx):
+        if not (0 <= idx < len(self.packs)):
+            return
+        self.current_pack_index = idx
+        pack = self.packs[idx]
+
+        name = ""
+        if 0 <= pack.index < len(self.app.pack_names):
+            name = self.app.pack_names[pack.index].strip()
+        if not name:
+            name = f"Pack {pack.index}"
+
+        self.pack_info_label.config(
+            text=f"{name} (index {pack.index}) @ 0x{pack.struct_off:08X}"
+        )
+
+        # header
+        self.cost_var.set(pack.cost)
+        self.cards_per_pack_var.set(pack.cards_per_pack)
+        self.card_amount_var.set(pack.card_amount)
+        self.unk0_var.set(f"0x{pack.unk0:04X}")
+        self.unk1_var.set(f"0x{pack.unk1:04X}")
+        self.padding_var.set(f"0x{pack.padding:04X}")
+
+        self._rebuild_contents()
+
+        self.pack_listbox.selection_clear(0, tk.END)
+        self.pack_listbox.selection_set(idx)
+        self.pack_listbox.see(idx)
+
+    def _on_card_amount_changed(self):
+        self._apply_ui_to_pack()
+        self._rebuild_contents()
+
+    def _label_for_konami(self, kid):
+        idx = self.app.konami_to_deck_choice_index.get(kid)
+        if idx is not None:
+            return self.app.deck_card_choices[idx]
+        return f"{kid:04d}"
+
+    def _filter_card_combo(self, event, combo: ttk.Combobox, var: tk.StringVar):
+        pattern = var.get().lower()
+        if not pattern:
+            filtered = self.app.deck_card_choices
+        else:
+            filtered = [lbl for lbl in self.app.deck_card_choices if pattern in lbl.lower()]
+        combo["values"] = filtered
+
+    def _rebuild_contents(self):
+        pack = self.packs[self.current_pack_index]
+
+        # normalize contents length to card_amount
+        n = max(0, self.card_amount_var.get())
+        pack.card_amount = n
+
+        while len(pack.contents) < n:
+            default_kid = self.app.deck_card_choice_konami[0] if self.app.deck_card_choice_konami else 0
+            pack.contents.append((default_kid, 0))
+        pack.contents = pack.contents[:n]
+
+        # clear old widgets
+        for child in self.contents_inner.winfo_children():
+            child.destroy()
+        self.card_vars = []
+        self.rarity_vars = []
+
+        for i, (kid, rar) in enumerate(pack.contents):
+            row = i
+            tk.Label(self.contents_inner, text=f"{i+1:02d}").grid(row=row, column=0, sticky="e", padx=2, pady=1)
+
+            # Card ID dropdown
+            card_var = tk.StringVar()
+            card_var.set(self._label_for_konami(kid))
+            card_combo = ttk.Combobox(
+                self.contents_inner,
+                textvariable=card_var,
+                values=self.app.deck_card_choices,
+                width=30
+            )
+            card_combo.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+            card_combo.bind(
+                "<KeyRelease>",
+                lambda e, cb=card_combo, v=card_var: self._filter_card_combo(e, cb, v)
+            )
+            self.card_vars.append(card_var)
+
+            # Rarity dropdown
+            rarity_var = tk.StringVar()
+            rar_idx = rar if 0 <= rar < len(self.app.rarities) else 0
+            rarity_var.set(self.app.rarities[rar_idx])
+            rar_combo = ttk.Combobox(
+                self.contents_inner,
+                textvariable=rarity_var,
+                values=self.app.rarities,
+                width=18,
+                state="readonly"
+            )
+            rar_combo.grid(row=row, column=2, sticky="w", padx=2, pady=1)
+            self.rarity_vars.append(rarity_var)
+
+    def _apply_ui_to_pack(self):
+        if not self.packs:
+            return
+        pack = self.packs[self.current_pack_index]
+
+        # header
+        try:
+            pack.cost = int(self.cost_var.get()) & 0xFFFF
+        except (ValueError, tk.TclError):
+            pass
+
+        try:
+            cpp = int(self.cards_per_pack_var.get())
+            pack.cards_per_pack = max(0, cpp) & 0xFFFF
+        except (ValueError, tk.TclError):
+            pass
+
+        try:
+            pack.card_amount = int(self.card_amount_var.get()) & 0xFFFF
+        except (ValueError, tk.TclError):
+            pass
+
+        # hex fields
+        def _parse_hex_or_dec(txt, default):
+            txt = txt.strip()
+            if not txt:
+                return default
+            if txt.lower().startswith("0x"):
+                try:
+                    return int(txt, 16) & 0xFFFF
+                except ValueError:
+                    return default
+            try:
+                return int(txt) & 0xFFFF
+            except ValueError:
+                return default
+
+        pack.unk0 = _parse_hex_or_dec(self.unk0_var.get(), pack.unk0)
+        pack.unk1 = _parse_hex_or_dec(self.unk1_var.get(), pack.unk1)
+        pack.padding = _parse_hex_or_dec(self.padding_var.get(), pack.padding)
+
+        # contents
+        new_contents = []
+        for card_var, rar_var in zip(self.card_vars, self.rarity_vars):
+            lbl = card_var.get()
+            if ":" in lbl:
+                kid_txt = lbl.split(":", 1)[0].strip()
+            else:
+                kid_txt = lbl.strip()
+            try:
+                kid = int(kid_txt)
+            except ValueError:
+                kid = 0
+
+            rar_name = rar_var.get()
+            if rar_name in self.app.rarities:
+                rar_idx = self.app.rarities.index(rar_name)
+            else:
+                rar_idx = 0
+
+            new_contents.append((kid & 0xFFFF, rar_idx & 0xFFFF))
+
+        pack.contents = new_contents[:pack.card_amount]
+
+    def _on_save_clicked(self):
+        self._apply_ui_to_pack()
+        pack = self.packs[self.current_pack_index]
+        self.app._write_pack_to_rom(pack)
+        messagebox.showinfo("Pack Editor", f"Pack {pack.index} saved to ROM.")
+
+    def _build_ui(self):
+        main_frame = tk.Frame(self)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Left: pack list
+        left_frame = tk.Frame(main_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y)
+
+        tk.Label(left_frame, text="Packs").pack(anchor="w")
+        self.pack_listbox = tk.Listbox(left_frame, width=32, height=20)
+        self.pack_listbox.pack(side=tk.LEFT, fill=tk.Y)
+        sb = tk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.pack_listbox.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.pack_listbox.config(yscrollcommand=sb.set)
+        self.pack_listbox.bind("<<ListboxSelect>>", self._on_pack_selected)
+
+        # populate
+        for p in self.packs:
+            name = ""
+            if 0 <= p.index < len(self.app.pack_names):
+                name = self.app.pack_names[p.index].strip()
+            if not name:
+                name = f"Pack {p.index}"
+            self.pack_listbox.insert(tk.END, name)
+
+        # Right: pack details
+        right_frame = tk.Frame(main_frame)
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+
+        self.pack_info_label = tk.Label(right_frame, text="No pack loaded")
+        self.pack_info_label.pack(anchor="w")
+
+        # Header fields
+        header = tk.LabelFrame(right_frame, text="Pack Header")
+        header.pack(fill=tk.X, pady=4)
+
+        row = 0
+        tk.Label(header, text="Cost:").grid(row=row, column=0, sticky="e")
+        tk.Entry(header, textvariable=self.cost_var, width=8).grid(row=row, column=1, sticky="w", padx=2)
+        tk.Label(header, text="Cards per pack:").grid(row=row, column=2, sticky="e")
+        e_card_amount = tk.Entry(header, textvariable=self.cards_per_pack_var, width=8)
+        e_card_amount.grid(row=row, column=3, sticky="w", padx=2)
+        e_card_amount.bind("<FocusOut>", lambda e: self._on_card_amount_changed())
+        row += 1
+
+        tk.Label(header, text="Card amount:").grid(row=row, column=0, sticky="e")
+        tk.Entry(header, textvariable=self.card_amount_var, width=8).grid(row=row, column=1, sticky="w", padx=2)
+
+        tk.Label(header, text="Unk0:").grid(row=row, column=2, sticky="e")
+        tk.Entry(header, textvariable=self.unk0_var, width=8).grid(row=row, column=3, sticky="w", padx=2)
+        row += 1
+
+        tk.Label(header, text="Unk1:").grid(row=row, column=0, sticky="e")
+        tk.Entry(header, textvariable=self.unk1_var, width=8).grid(row=row, column=1, sticky="w", padx=2)
+        tk.Label(header, text="Padding:").grid(row=row, column=2, sticky="e")
+        tk.Entry(header, textvariable=self.padding_var, width=8).grid(row=row, column=3, sticky="w", padx=2)
+
+        # Contents (scrollable)
+        contents_outer = tk.Frame(right_frame)
+        contents_outer.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        self.contents_canvas = tk.Canvas(contents_outer, borderwidth=0)
+        self.contents_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        contents_scrollbar = tk.Scrollbar(
+            contents_outer, orient="vertical", command=self.contents_canvas.yview
+        )
+        contents_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.contents_canvas.configure(yscrollcommand=contents_scrollbar.set)
+
+        self.contents_inner = tk.Frame(self.contents_canvas)
+        self.contents_canvas.create_window((0, 0), window=self.contents_inner, anchor="nw")
+
+        def _on_inner_config(event):
+            self.contents_canvas.configure(scrollregion=self.contents_canvas.bbox("all"))
+
+        self.contents_inner.bind("<Configure>", _on_inner_config)
+
+        # Buttons
+        btn_frame = tk.Frame(right_frame)
+        btn_frame.pack(fill=tk.X, pady=(6, 0))
+
+        tk.Button(btn_frame, text="Save Pack Changes", command=self._on_save_clicked).pack(side=tk.LEFT)
+        tk.Button(btn_frame, text="Close", command=self.destroy).pack(side=tk.RIGHT)
 
 class DeckEditorWindow(tk.Toplevel):
     def __init__(self, app: RomEditorApp):
