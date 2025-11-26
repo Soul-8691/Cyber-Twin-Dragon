@@ -90,11 +90,29 @@ PRICE_TABLE_BASE    = 0x1CEDFA4  # 4 bytes per card, little endian
 PASSWORD_ENTRY_SIZE = 4
 PRICE_ENTRY_SIZE    = 4
 
+# Deck pointer table
+DECK_PTR_TABLE_BASE = 0x1E63BEC  # 4-byte little-endian pointers, ROM-address (0x08000000-based)
+DECK_PTR_ENTRY_SIZE = 4
+GBA_ROM_BASE        = 0x08000000  # for converting ROM addresses -> file offsets
+NUM_DECKS           = 215
+FREE_SPACE_START    = 0x162248B
+
 class ArtworkEntry:
     def __init__(self, index, unk_halfword, card_name_index):
         self.index = index                 # artwork slot index (0..2330)
         self.unk_halfword = unk_halfword   # first 2 bytes, unknown but editable
         self.card_name_index = card_name_index  # second 2 bytes: index into card names table
+
+class DeckEntry:
+    def __init__(self, index, ptr_off, struct_off,
+                 unk_values, main_cards, extra_cards, original_size):
+        self.index = index                  # deck index in pointer table
+        self.ptr_off = ptr_off              # offset of pointer in ROM
+        self.struct_off = struct_off        # current deck structure offset in ROM
+        self.unk = list(unk_values)         # [unk0, unk1, unk2, unk3] as u16
+        self.main_cards = list(main_cards)  # list of Konami IDs (u16)
+        self.extra_cards = list(extra_cards)
+        self.original_size = original_size  # bytes originally allocated
 
 class CardEntry:
     def __init__(
@@ -190,9 +208,82 @@ class RomEditorApp(tk.Tk):
 
         self.artwork_names = []
 
+        self.decks = []                     # list[DeckEntry]
+        self.konami_to_card_index = {}      # filled after parsing cards
+        self.deck_card_choices = []         # "ID: Name" for deck dropdowns
+        self.deck_card_choice_konami = []   # konami_id list aligned with above
+        self.konami_to_deck_choice_index = {}
+        self.deck_names = []  # index -> name from text/decks.txt
+
         self._load_text_mappings()
         self._load_json_mappings()
         self._build_ui()
+
+    def _write_deck_to_rom(self, deck: DeckEntry):
+        """
+        Write a single deck back into self.rom_data.
+        If the new deck structure is larger than the original, repoint it
+        to a fresh 0xFF region and update the pointer table.
+        """
+        if self.rom_data is None:
+            return
+
+        rom = self.rom_data
+        blob = self._encode_deck_structure(deck)
+        new_size = len(blob)
+
+        # If we can fit in the original space, write in-place
+        if new_size <= deck.original_size:
+            write_off = deck.struct_off
+            rom[write_off:write_off + new_size] = blob
+            # Optional: fill leftover bytes with 0xFF
+            if new_size < deck.original_size:
+                rom[write_off + new_size:write_off + deck.original_size] = b"\xFF" * (deck.original_size - new_size)
+            return
+
+        # Otherwise, find new free space of 0xFF
+        new_off = self._find_free_space_ff(rom, new_size)
+        if new_off is None:
+            messagebox.showerror("Error", f"No free space large enough for deck {deck.index}.")
+            return
+
+        # Mark old region as free
+        rom[deck.struct_off:deck.struct_off + deck.original_size] = b"\xFF" * deck.original_size
+
+        # Write new deck
+        rom[new_off:new_off + new_size] = blob
+
+        # Update pointer
+        new_ptr_val = new_off + GBA_ROM_BASE
+        self._write_u32(rom, deck.ptr_off, new_ptr_val)
+
+        # Update deck metadata for future edits
+        deck.struct_off = new_off
+        deck.original_size = new_size
+
+    def _load_deck_names(self):
+        """
+        Load deck names from text/decks.txt.
+        Each line corresponds to the deck at that index.
+        """
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base_dir = os.getcwd()
+
+        path = os.path.join(base_dir, "..", "text", "decks.txt")
+        names = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    name = line.strip()
+                    names.append(name)
+        except FileNotFoundError:
+            names = []
+        except Exception:
+            names = []
+
+        self.deck_names = names
 
     def _write_name_sort_table(self, rom_data):
         """
@@ -1084,6 +1175,14 @@ class RomEditorApp(tk.Tk):
                 )
         return self._icon_palette_cache
 
+    def open_deck_editor(self):
+        if self.rom_data is None or not self.cards:
+            messagebox.showinfo("No ROM", "Load a ROM first.")
+            return
+        if not self.decks:
+            self._parse_decks()
+        DeckEditorWindow(self)
+
     # =========================
     # UI SETUP
     # =========================
@@ -1097,6 +1196,12 @@ class RomEditorApp(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
+
+        # Deck menu
+        deck_menu = tk.Menu(menubar, tearoff=False)
+        deck_menu.add_command(label="Deck Editor...", command=self.open_deck_editor)
+        menubar.add_cascade(label="Decks", menu=deck_menu)
+
         self.config(menu=menubar)
 
         # Main layout
@@ -1380,6 +1485,104 @@ class RomEditorApp(tk.Tk):
         self.konami_main_var.trace_add("write", self._on_konami_main_changed)
         self.konami_sec_var.trace_add("write", self._on_konami_sec_changed)
 
+    def _parse_decks(self):
+        """
+        Parse up to NUM_DECKS decks from the deck pointer table.
+        Each pointer is a 4-byte ROM address (0x08000000-based).
+        """
+        self.decks = []
+        if self.rom_data is None:
+            return
+
+        data = self.rom_data
+        ptr_off = DECK_PTR_TABLE_BASE
+
+        for deck_idx in range(NUM_DECKS):
+            if ptr_off + DECK_PTR_ENTRY_SIZE > len(data):
+                break
+
+            ptr_val = self._read_u32(data, ptr_off)
+
+            # If you know unused entries are zeroed, you can break on 0
+            if ptr_val in (0, 0xFFFFFFFF):
+                break
+
+            struct_off = ptr_val - GBA_ROM_BASE
+            if not (0 <= struct_off < len(data)):
+                break
+
+            deck = self._parse_single_deck(deck_idx, ptr_off, struct_off)
+            if deck is None:
+                break
+
+            self.decks.append(deck)
+            ptr_off += DECK_PTR_ENTRY_SIZE
+
+    def _parse_single_deck(self, index, ptr_off, struct_off):
+        data = self.rom_data
+        if struct_off + 8 + 2 > len(data):
+            return None
+
+        # 8 bytes of unknowns: 4 halfwords
+        unk_values = [self._read_u16(data, struct_off + 2 * i) for i in range(4)]
+        pos = struct_off + 8
+
+        # Main deck
+        main_count = self._read_u16(data, pos)
+        pos += 2
+        main_cards = []
+        for _ in range(main_count):
+            if pos + 2 > len(data):
+                return None
+            main_cards.append(self._read_u16(data, pos))
+            pos += 2
+
+        # Extra deck
+        extra_count = self._read_u16(data, pos)
+        pos += 2
+        extra_cards = []
+        for _ in range(extra_count):
+            if pos + 2 > len(data):
+                return None
+            extra_cards.append(self._read_u16(data, pos))
+            pos += 2
+
+        # Terminator
+        term = self._read_u16(data, pos) if pos + 2 <= len(data) else 0
+        pos += 2
+
+        original_size = pos - struct_off
+        return DeckEntry(index, ptr_off, struct_off, unk_values, main_cards, extra_cards, original_size)
+
+    def _encode_deck_structure(self, deck: DeckEntry) -> bytes:
+        """
+        Encode a DeckEntry back into raw bytes:
+
+        unk0..unk3 (4x u16)
+        main_count (u16)
+        main_cards (u16 each)
+        extra_count (u16)
+        extra_cards (u16 each)
+        0x0000 terminator (u16)
+        """
+        buf = bytearray()
+        for val in deck.unk:
+            buf += int(val & 0xFFFF).to_bytes(2, "little")
+
+        main_count = len(deck.main_cards)
+        extra_count = len(deck.extra_cards)
+
+        buf += int(main_count & 0xFFFF).to_bytes(2, "little")
+        for kid in deck.main_cards:
+            buf += int(kid & 0xFFFF).to_bytes(2, "little")
+
+        buf += int(extra_count & 0xFFFF).to_bytes(2, "little")
+        for kid in deck.extra_cards:
+            buf += int(kid & 0xFFFF).to_bytes(2, "little")
+
+        buf += b"\x00\x00"  # terminator
+        return bytes(buf)
+
     # =========================
     # ROM HANDLING
     # =========================
@@ -1411,6 +1614,9 @@ class RomEditorApp(tk.Tk):
             return
 
         self._update_card_id_choices()
+        self._build_deck_card_choices()
+        self._load_deck_names()
+        self._parse_decks()
         self.current_index = 0
         self.clear_filter()
         self._load_card_into_editor(0)
@@ -1468,6 +1674,39 @@ class RomEditorApp(tk.Tk):
             pos += 1
         s = bytes(out).decode("ascii", errors="replace")
         return s, len(out)
+
+    @staticmethod
+    def _read_u32(data, offset):
+        return int.from_bytes(data[offset:offset + 4], "little")
+
+    @staticmethod
+    def _write_u32(data, offset, value):
+        data[offset:offset + 4] = int(value & 0xFFFFFFFF).to_bytes(4, "little")
+
+    def _find_free_space_ff(self, rom_data, size):
+        """
+        Find a run of 0xFF bytes of at least 'size' anywhere in the ROM.
+        Used for repointing decks when they expand.
+        """
+        if size <= 0:
+            return None
+
+        run_start = None
+        run_len = 0
+        end = len(rom_data)
+        for addr in range(FREE_SPACE_START, end):
+            if rom_data[addr] == 0xFF:
+                if run_start is None:
+                    run_start = addr
+                    run_len = 1
+                else:
+                    run_len += 1
+                if run_len >= size:
+                    return run_start
+            else:
+                run_start = None
+                run_len = 0
+        return None
 
     @staticmethod
     def _read_u16(data, offset):
@@ -1631,8 +1870,37 @@ class RomEditorApp(tk.Tk):
             card.st_race2 = st_race2
             card.padding2 = padding2
 
+        # Build Konami ID -> card index mapping
+        self.konami_to_card_index = {}
+        for c in cards:
+            if c.konami_id not in self.konami_to_card_index:
+                self.konami_to_card_index[c.konami_id] = c.index
+
         # Any card without second_stats_index keeps card_id_index2 as 0xFFFF (None)
         return cards
+
+    def _build_deck_card_choices(self):
+        """
+        Build display list for deck editor: 'KonamiID: Name'.
+        """
+        self.deck_card_choices = []
+        self.deck_card_choice_konami = []
+        self.konami_to_deck_choice_index = {}
+
+        # Sort by Konami ID
+        sorted_cards = sorted(self.cards, key=lambda c: c.konami_id)
+
+        for c in sorted_cards:
+            name = c.name.replace("\n", " ")
+            if len(name) > 30:
+                name = name[:30] + "..."
+            label = f"{c.konami_id:04d}: {name}"
+            self.deck_card_choices.append(label)
+            self.deck_card_choice_konami.append(c.konami_id)
+
+        self.konami_to_deck_choice_index = {
+            kid: idx for idx, kid in enumerate(self.deck_card_choice_konami)
+        }
 
     # =========================
     # FREE SPACE / WRITE
@@ -2355,6 +2623,321 @@ class RomEditorApp(tk.Tk):
         # Update the UI label; if idx_val == 0xFFFF, this will show 'Name (None)'
         # using the YGOPRODeck mapping.
         self._set_card_id_ui(self.card_id_sec_var, idx_val, konami2)
+
+
+class DeckEditorWindow(tk.Toplevel):
+    def __init__(self, app: RomEditorApp):
+        super().__init__(app)
+        self.app = app
+        self.title("Yu-Gi-Oh! UM 2006 – Deck Editor")
+
+        self.decks = app.decks
+        self.current_deck_index = 0
+
+        # UI state
+        self.unk_vars = [tk.StringVar() for _ in range(4)]
+        self.main_count_var = tk.IntVar()
+        self.extra_count_var = tk.IntVar()
+        self.main_card_vars = []   # list[StringVar]
+        self.extra_card_vars = []  # list[StringVar]
+
+        self._build_ui()
+        if self.decks:
+            self._load_deck_into_editor(0)
+
+    def _filter_card_combo(self, event, combo: ttk.Combobox, var: tk.StringVar):
+        """
+        Filter card choices in this combobox based on current text.
+        """
+        pattern = var.get().lower()
+        if not pattern:
+            filtered = self.app.deck_card_choices
+        else:
+            filtered = [
+                lbl for lbl in self.app.deck_card_choices
+                if pattern in lbl.lower()
+            ]
+        combo["values"] = filtered
+        # Optional: open dropdown as you type
+        # combo.event_generate("<Down>")
+
+    def _build_ui(self):
+        main_frame = tk.Frame(self)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Left: deck list
+        left_frame = tk.Frame(main_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y)
+
+        tk.Label(left_frame, text="Decks").pack(anchor="w")
+        self.deck_listbox = tk.Listbox(left_frame, width=24, height=20)
+        self.deck_listbox.pack(side=tk.LEFT, fill=tk.Y)
+        sb = tk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.deck_listbox.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.deck_listbox.config(yscrollcommand=sb.set)
+        self.deck_listbox.bind("<<ListboxSelect>>", self._on_deck_selected)
+
+        for d in self.decks:
+            name = ""
+            if 0 <= d.index < len(self.app.deck_names):
+                name = self.app.deck_names[d.index].strip()
+            if not name:
+                name = f"Deck {d.index}"
+            self.deck_listbox.insert(tk.END, name)
+
+        # Right: deck details
+        right_frame = tk.Frame(main_frame)
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+
+        self.deck_info_label = tk.Label(right_frame, text="No deck loaded")
+        self.deck_info_label.pack(anchor="w")
+
+        # Unknowns
+        unk_frame = tk.LabelFrame(right_frame, text="Unknown Header (8 bytes)")
+        unk_frame.pack(fill=tk.X, pady=4)
+
+        for i in range(4):
+            tk.Label(unk_frame, text=f"unk{i}:").grid(row=0, column=2*i, sticky="e", padx=2)
+            e = tk.Entry(unk_frame, textvariable=self.unk_vars[i], width=8)
+            e.grid(row=0, column=2*i+1, sticky="w", padx=2)
+
+        # Counts
+        counts_frame = tk.Frame(right_frame)
+        counts_frame.pack(fill=tk.X, pady=4)
+
+        tk.Label(counts_frame, text="Main count:").grid(row=0, column=0, sticky="e")
+        main_entry = tk.Entry(counts_frame, textvariable=self.main_count_var, width=5)
+        main_entry.grid(row=0, column=1, sticky="w", padx=2)
+        main_entry.bind("<FocusOut>", lambda e: self._on_counts_changed())
+
+        tk.Label(counts_frame, text="Extra count:").grid(row=0, column=2, sticky="e")
+        extra_entry = tk.Entry(counts_frame, textvariable=self.extra_count_var, width=5)
+        extra_entry.grid(row=0, column=3, sticky="w", padx=2)
+        extra_entry.bind("<FocusOut>", lambda e: self._on_counts_changed())
+
+        # Card lists (scrollable)
+        lists_outer = tk.Frame(right_frame)
+        lists_outer.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        self.lists_canvas = tk.Canvas(lists_outer, borderwidth=0)
+        self.lists_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        lists_scrollbar = tk.Scrollbar(
+            lists_outer,
+            orient="vertical",
+            command=self.lists_canvas.yview
+        )
+        lists_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.lists_canvas.configure(yscrollcommand=lists_scrollbar.set)
+
+        # Inner frame that actually holds the main/extra frames
+        self.lists_inner = tk.Frame(self.lists_canvas)
+        self.lists_canvas.create_window((0, 0), window=self.lists_inner, anchor="nw")
+
+        def _on_inner_config(event):
+            # Update scrollregion when content size changes
+            self.lists_canvas.configure(scrollregion=self.lists_canvas.bbox("all"))
+
+        self.lists_inner.bind("<Configure>", _on_inner_config)
+
+        # Now create main/extra frames inside the inner frame
+        self.main_cards_frame = tk.LabelFrame(self.lists_inner, text="Main Deck")
+        self.main_cards_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+
+        self.extra_cards_frame = tk.LabelFrame(self.lists_inner, text="Extra Deck")
+        self.extra_cards_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+
+        # Bottom: buttons
+        btn_frame = tk.Frame(right_frame)
+        btn_frame.pack(fill=tk.X, pady=(6, 0))
+
+        tk.Button(btn_frame, text="Save Deck Changes", command=self._on_save_clicked).pack(side=tk.LEFT)
+        tk.Button(btn_frame, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+
+    # ---- deck loading ----
+
+    def _on_deck_selected(self, event):
+        sel = self.deck_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self._apply_ui_to_deck()
+        self._load_deck_into_editor(idx)
+
+    def _load_deck_into_editor(self, idx):
+        if not (0 <= idx < len(self.decks)):
+            return
+        self.current_deck_index = idx
+        deck = self.decks[idx]
+
+        name = ""
+        if 0 <= deck.index < len(self.app.deck_names):
+            name = self.app.deck_names[deck.index].strip()
+        if not name:
+            name = f"Deck {deck.index}"
+
+        self.deck_info_label.config(
+            text=f"{name} (index {deck.index}) @ 0x{deck.struct_off:08X} (size {deck.original_size} bytes)"
+        )
+
+        # Unknowns as hex
+        for i in range(4):
+            self.unk_vars[i].set(f"0x{deck.unk[i]:04X}")
+
+        self.main_count_var.set(len(deck.main_cards))
+        self.extra_count_var.set(len(deck.extra_cards))
+
+        self._rebuild_card_lists()
+
+        # select in listbox
+        self.deck_listbox.selection_clear(0, tk.END)
+        self.deck_listbox.selection_set(idx)
+        self.deck_listbox.see(idx)
+
+    def _on_counts_changed(self):
+        self._apply_ui_to_deck()
+        self._rebuild_card_lists()
+
+    def _rebuild_card_lists(self):
+        deck = self.decks[self.current_deck_index]
+
+        # Normalize counts vs list lengths
+        main_count = max(0, self.main_count_var.get())
+        extra_count = max(0, self.extra_count_var.get())
+
+        # Grow / shrink lists to match counts
+        while len(deck.main_cards) < main_count:
+            # default to first known Konami ID
+            if self.app.deck_card_choice_konami:
+                deck.main_cards.append(self.app.deck_card_choice_konami[0])
+            else:
+                deck.main_cards.append(0)
+        deck.main_cards = deck.main_cards[:main_count]
+
+        while len(deck.extra_cards) < extra_count:
+            if self.app.deck_card_choice_konami:
+                deck.extra_cards.append(self.app.deck_card_choice_konami[0])
+            else:
+                deck.extra_cards.append(0)
+        deck.extra_cards = deck.extra_cards[:extra_count]
+
+        # Clear frames
+        for child in self.main_cards_frame.winfo_children():
+            child.destroy()
+        for child in self.extra_cards_frame.winfo_children():
+            child.destroy()
+
+        self.main_card_vars = []
+        self.extra_card_vars = []
+
+        # Build main deck rows
+        for i, kid in enumerate(deck.main_cards):
+            row = i
+            tk.Label(self.main_cards_frame, text=f"{i+1:02d}").grid(row=row, column=0, sticky="e", padx=2, pady=1)
+            var = tk.StringVar()
+            label = self._label_for_konami(kid)
+            var.set(label)
+            cmb = ttk.Combobox(
+                self.main_cards_frame,
+                textvariable=var,
+                values=self.app.deck_card_choices,
+                width=30
+            )
+            cmb.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+            # Filter on typing
+            cmb.bind(
+                "<KeyRelease>",
+                lambda e, cb=cmb, v=var: self._filter_card_combo(e, cb, v)
+            )
+            self.main_card_vars.append(var)
+
+        # Build extra deck rows
+        for i, kid in enumerate(deck.extra_cards):
+            row = i
+            tk.Label(self.extra_cards_frame, text=f"{i+1:02d}").grid(row=row, column=0, sticky="e", padx=2, pady=1)
+            var = tk.StringVar()
+            label = self._label_for_konami(kid)
+            var.set(label)
+            cmb = ttk.Combobox(
+                self.extra_cards_frame,
+                textvariable=var,
+                values=self.app.deck_card_choices,
+                width=30
+            )
+            cmb.grid(row=row, column=1, sticky="w", padx=2, pady=1)
+            cmb.bind(
+                "<KeyRelease>",
+                lambda e, cb=cmb, v=var: self._filter_card_combo(e, cb, v)
+            )
+            self.extra_card_vars.append(var)
+
+    def _label_for_konami(self, kid):
+        # Use the prebuilt choices if we know where this Konami ID lives
+        idx = self.app.konami_to_deck_choice_index.get(kid)
+        if idx is not None:
+            return self.app.deck_card_choices[idx]
+        # Fallback: raw ID
+        return f"{kid:04d}"
+
+    # ---- apply UI → DeckEntry ----
+
+    def _apply_ui_to_deck(self):
+        if not self.decks:
+            return
+        deck = self.decks[self.current_deck_index]
+
+        # Unknowns: accept hex like 0x1234 or decimal
+        for i in range(4):
+            txt = self.unk_vars[i].get().strip()
+            if txt.lower().startswith("0x"):
+                try:
+                    deck.unk[i] = int(txt, 16) & 0xFFFF
+                except ValueError:
+                    pass
+            else:
+                try:
+                    deck.unk[i] = int(txt) & 0xFFFF
+                except ValueError:
+                    pass
+
+        # Counts already normalized in _rebuild_card_lists
+
+        # Main cards
+        new_main = []
+        for var in self.main_card_vars:
+            lbl = var.get()
+            if ":" in lbl:
+                kid_txt = lbl.split(":", 1)[0].strip()
+            else:
+                kid_txt = lbl.strip()
+            try:
+                kid = int(kid_txt)
+            except ValueError:
+                kid = 0
+            new_main.append(kid & 0xFFFF)
+        deck.main_cards = new_main
+
+        # Extra cards
+        new_extra = []
+        for var in self.extra_card_vars:
+            lbl = var.get()
+            if ":" in lbl:
+                kid_txt = lbl.split(":", 1)[0].strip()
+            else:
+                kid_txt = lbl.strip()
+            try:
+                kid = int(kid_txt)
+            except ValueError:
+                kid = 0
+            new_extra.append(kid & 0xFFFF)
+        deck.extra_cards = new_extra
+
+    def _on_save_clicked(self):
+        self._apply_ui_to_deck()
+        deck = self.decks[self.current_deck_index]
+        self.app._write_deck_to_rom(deck)
+        messagebox.showinfo("Deck Editor", f"Deck {deck.index} saved to ROM.")
 
 
 if __name__ == "__main__":
