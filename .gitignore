@@ -210,3 +210,11 @@ json/ygoprodeck_card_info.json
 screenshots/
 *.sav
 *.toml
+*.4bpp
+*.8bpp
+*.6bpp
+*.bin
+*.bak
+*.pal
+*.gbapal
+*.act
