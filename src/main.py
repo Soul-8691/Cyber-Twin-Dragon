@@ -215,6 +215,8 @@ class RomEditorApp(tk.Tk):
         self.konami_to_deck_choice_index = {}
         self.deck_names = []  # index -> name from text/decks.txt
 
+        self.password_to_konami = {}  # password (int) -> konami_id
+
         self._load_text_mappings()
         self._load_json_mappings()
         self._build_ui()
@@ -1876,6 +1878,14 @@ class RomEditorApp(tk.Tk):
             if c.konami_id not in self.konami_to_card_index:
                 self.konami_to_card_index[c.konami_id] = c.index
 
+        # NEW: build password -> konami_id mapping
+        self.password_to_konami = {}
+        for c in cards:
+            pw = getattr(c, "password", 0)
+            if pw and isinstance(pw, int):
+                # Don't overwrite if duplicates (shouldn't happen, but be safe)
+                self.password_to_konami.setdefault(pw, c.konami_id)
+
         # Any card without second_stats_index keeps card_id_index2 as 0xFFFF (None)
         return cards
 
@@ -2752,8 +2762,163 @@ class DeckEditorWindow(tk.Toplevel):
         btn_frame = tk.Frame(right_frame)
         btn_frame.pack(fill=tk.X, pady=(6, 0))
 
-        tk.Button(btn_frame, text="Save Deck Changes", command=self._on_save_clicked).pack(side=tk.LEFT)
-        tk.Button(btn_frame, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+        tk.Button(
+            btn_frame,
+            text="Import YDK...",
+            command=self._import_ydk
+        ).pack(side=tk.LEFT)
+
+        tk.Button(
+            btn_frame,
+            text="Save Deck Changes",
+            command=self._on_save_clicked
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
+        tk.Button(
+            btn_frame,
+            text="Close",
+            command=self.destroy
+        ).pack(side=tk.RIGHT)
+
+    def _parse_ydk_file(self, path):
+        """
+        Parse a .ydk file and return (main_pw_list, extra_pw_list),
+        where each list contains integer passwords from #main / #extra.
+        """
+        main_pw = []
+        extra_pw = []
+        section = None
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Strip full-line comments beginning with --
+                    if line.startswith("--"):
+                        continue
+
+                    # Strip inline comments after --
+                    comment_pos = line.find("--")
+                    if comment_pos != -1:
+                        line = line[:comment_pos].strip()
+                        if not line:
+                            continue  # Line becomes empty after removing comment
+
+                    # YDK section markers (#main, #extra, #side)
+                    if line.startswith("#"):
+                        if line.lower() == "#main":
+                            section = "main"
+                        elif line.lower() == "#extra":
+                            section = "extra"
+                        elif line.lower() == "#side":
+                            section = None  # ignore side deck
+                        continue
+
+                    # Some YDK variants mark comments with '!'
+                    if line.startswith("!"):
+                        continue
+
+                    # Now read card-password lines if we're in #main or #extra
+                    if section in ("main", "extra"):
+                        if line.isdigit():
+                            val = int(line)
+                            if section == "main":
+                                main_pw.append(val)
+                            else:
+                                extra_pw.append(val)
+        except Exception as e:
+            messagebox.showerror("YDK Error", f"Failed to read YDK file:\n{e}")
+            return [], []
+
+        return main_pw, extra_pw
+
+    def _import_ydk(self):
+        """
+        Import card passwords from a .ydk file and fill the current deck:
+          - #main  -> main deck slots
+          - #extra -> extra deck slots
+
+        For each YDK password:
+          - if it matches a ROM card password, we get its Konami ID
+          - we write that Konami ID into the first available slot
+            (0 or 0xFFFF) in main/extra
+          - if no free slot exists, we expand the deck by adding a slot
+        """
+        if not self.decks:
+            messagebox.showinfo("Deck Editor", "No decks available.")
+            return
+
+        deck = self.decks[self.current_deck_index]
+
+        # Make sure we have the latest UI->deck values
+        self._apply_ui_to_deck()
+
+        path = filedialog.askopenfilename(
+            title="Select YDK deck file",
+            filetypes=[("YGOPro Deck Files", "*.ydk"), ("All Files", "*.*")]
+        )
+        if not path:
+            return
+
+        main_pw, extra_pw = self._parse_ydk_file(path)
+        app = self.app
+
+        if not main_pw and not extra_pw:
+            messagebox.showinfo("YDK Import", "No #main or #extra cards found in the YDK file.")
+            return
+
+        # --- Helper to fill deck slots given a list of passwords + target list ---
+
+        def fill_deck_slots_sequential(pw_list, cards_list):
+            """
+            For each password (in order):
+              - convert to Konami ID using app.password_to_konami
+              - replace cards_list[target_index] starting from 0
+              - if target_index >= len(cards_list), append (expand deck)
+              - passwords that don't exist in the ROM are skipped and do NOT
+                advance target_index.
+            """
+            changed = False
+            target_index = 0
+
+            for pw in pw_list:
+                konami_id = app.password_to_konami.get(pw)
+                if konami_id is None:
+                    # Not present in this ROM; skip without advancing target_index
+                    continue
+
+                if target_index < len(cards_list):
+                    cards_list[target_index] = konami_id & 0xFFFF
+                else:
+                    cards_list.append(konami_id & 0xFFFF)
+
+                target_index += 1
+                changed = True
+
+            return changed
+
+        # Fill main and extra lists
+        main_changed = fill_deck_slots_sequential(main_pw, deck.main_cards)
+        extra_changed = fill_deck_slots_sequential(extra_pw, deck.extra_cards)
+
+        if not (main_changed or extra_changed):
+            messagebox.showinfo(
+                "YDK Import",
+                "No cards from the YDK file matched any passwords in this ROM."
+            )
+            return
+
+        # Update counts based on new sizes
+        self.main_count_var.set(len(deck.main_cards))
+        self.extra_count_var.set(len(deck.extra_cards))
+
+        # Rebuild UI lists to reflect changes
+        self._rebuild_card_lists()
+
+        messagebox.showinfo("YDK Import", "YDK deck imported into current deck.")
 
     # ---- deck loading ----
 
