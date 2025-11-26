@@ -423,7 +423,7 @@ class RomEditorApp(tk.Tk):
             if stored == 0xFFFF:
                 card_idx = 0xFFFF  # optional sentinel handling, if ever used
             else:
-                card_idx = stored + 1
+                card_idx = stored
 
             artworks.append(ArtworkEntry(i, unk, card_idx))
         self.artworks = artworks
