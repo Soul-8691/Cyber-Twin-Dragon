@@ -524,16 +524,17 @@ class RomEditorApp(tk.Tk):
             off = ARTWORK_TABLE_BASE + i * 4
             if off + 4 > len(data):
                 break
+
             unk = self._read_u16(data, off)
 
             stored = self._read_u16(data, off + 2)
-            # Artwork table stores (card_name_index - 1)
             if stored == 0xFFFF:
-                card_idx = 0xFFFF  # optional sentinel handling, if ever used
+                card_idx = 0xFFFF
             else:
-                card_idx = stored
+                card_idx = stored  # direct index into card names
 
             artworks.append(ArtworkEntry(i, unk, card_idx))
+
         self.artworks = artworks
 
     def _decode_6bpp_to_8bpp(self, data_6bpp: bytes) -> bytes:
@@ -1440,7 +1441,7 @@ class RomEditorApp(tk.Tk):
         row += 1
 
         # Existing artwork table controls follow
-        tk.Label(artwork_frame, text="Unknown halfword:").grid(row=row, column=0, sticky="w", padx=2, pady=1)
+        tk.Label(artwork_frame, text="Unused Card (Name Index):").grid(row=row, column=0, sticky="w", padx=2, pady=1)
         self.artwork_unk_combo = ttk.Combobox(
             artwork_frame,
             textvariable=self.artwork_unk_var,
@@ -2054,7 +2055,10 @@ class RomEditorApp(tk.Tk):
             self._write_stats_primary(rom_copy, card)
             self._write_stats_secondary(rom_copy, card)
             self._write_card_id_entry(rom_copy, card.konami_id, card.card_id_index)
-            self._write_password_and_price(rom_copy, card)   # <<< new
+            self._write_password_and_price(rom_copy, card)
+
+        # Make sure the currently-selected artwork row is flushed from the UI
+        self._apply_artwork_ui_to_entry()
 
         # After all cards, write artwork table
         self._write_artwork_table(rom_copy)
@@ -2104,17 +2108,11 @@ class RomEditorApp(tk.Tk):
 
         # ------- SECOND HALFWORD -------
         # Read raw second halfword
-        off2 = ARTWORK_TABLE_BASE + idx*4 + 2
-        stored = self._read_u16(self.rom_data, off2)
-        if 0 <= stored < len(self.artwork_names):
-            self.artwork_card_var.set(self.artwork_names[stored])
+        card_name_idx = entry.card_name_index
+        if 0 <= card_name_idx < len(self.artwork_names):
+            self.artwork_card_var.set(self.artwork_names[card_name_idx])
         else:
             self.artwork_card_var.set("")
-
-        # ------- Resolved name label (optional) -------
-        self.artwork_name_var.set(
-            f"Unk→ {self.artwork_unk_var.get()}   |   CardIdx→ {self.artwork_card_var.get()}"
-        )
 
     def on_artwork_index_changed(self):
         if self._updating_artwork_index:
@@ -2294,6 +2292,9 @@ class RomEditorApp(tk.Tk):
         self._render_card_image(card)
         self._render_card_icons(card)
 
+        # --- Also persist Artwork tab changes for the current artwork slot ---
+        self._apply_artwork_ui_to_entry()
+
     def on_card_selected(self, event):
         if not self.cards or not self.filtered_indices:
             return
@@ -2338,12 +2339,20 @@ class RomEditorApp(tk.Tk):
             if off + 4 > len(rom_data):
                 break
 
-            # Write first halfword
-            self._write_u16(rom_data, off, entry.unk_halfword)
+            # First halfword: unknown field
+            self._write_u16(rom_data, off, entry.unk_halfword & 0xFFFF)
 
-            # Write second halfword
-            if entry.card_name_index > 0:
-                self._write_u16(rom_data, off + 2, entry.card_name_index)
+            # Second halfword: card name index or 0xFFFF
+            idx = entry.card_name_index
+
+            if idx is None or idx == 0xFFFF:
+                self._write_u16(rom_data, off + 2, 0xFFFF)
+            else:
+                idx = int(idx)
+                # Clamp to valid range; if bad, treat as "none"
+                if not (0 <= idx < NUM_CARDS):
+                    idx = 0xFFFF
+                self._write_u16(rom_data, off + 2, idx)
 
     def apply_changes(self):
         if self.current_index is None or not self.cards:
