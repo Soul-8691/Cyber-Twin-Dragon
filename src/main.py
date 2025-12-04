@@ -2070,7 +2070,7 @@ class RomEditorApp(tk.Tk):
             if card_name_index == 0xFFFF:
                 # "None" slot – doesn't map to an internal card name index.
                 continue
-            if not (0 <= card_name_index < NUM_CARDS):
+            if not (0 <= card_name_index < NUM_CARD_GFX):
                 continue
 
             card = cards[card_name_index]
@@ -2572,7 +2572,7 @@ class RomEditorApp(tk.Tk):
             else:
                 idx = int(idx)
                 # Clamp to valid range; if bad, treat as "none"
-                if not (0 <= idx < NUM_CARDS):
+                if not (0 <= idx < NUM_CARD_GFX):
                     idx = 0xFFFF
                 self._write_u16(rom_data, off + 2, idx)
 
