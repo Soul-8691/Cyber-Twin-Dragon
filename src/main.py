@@ -2729,18 +2729,76 @@ class RomEditorApp(tk.Tk):
     
     def _quantize_to_icon_palette(self, img_rgb: Image.Image) -> Image.Image:
         """
-        Takes an RGB image and quantizes it to the card icon palette
-        at 0x510440. Returns a 'P' mode image whose palette matches
-        the ROM's icon palette.
+        Takes an RGB image and quantizes it to the card icon palette at 0x510440.
+
+        Requirements:
+          - Palette index 0 is allowed (often background/transparent).
+          - Palette indices 1–15 must NOT be used.
+          - Palette indices 16–143 are valid.
+
+        Implementation:
+          - Build full icon palette from ROM.
+          - Build a temporary palette:
+              * entry 0   -> original palette[0]
+              * entries 1..128 -> original palette[16..143]
+          - Quantize against that temporary palette.
+          - Remap:
+              * 0   -> 0
+              * 1..128 -> 16..143 (p -> p-1+16)
+          - Attach original ROM palette and return.
         """
         pal_img = self._build_pillow_icon_palette()
         if pal_img is None:
             raise RuntimeError("Icon palette not available")
 
-        return img_rgb.convert("RGB").quantize(
-            palette=pal_img,
+        full_pal = pal_img.getpalette()
+        if full_pal is None or len(full_pal) < 256 * 3:
+            raise RuntimeError("Icon palette is malformed")
+
+        # --- Build restricted quantization palette ---
+        # Keep original color 0 at index 0
+        tmp_pal_list = []
+        tmp_pal_list.extend(full_pal[0:3])  # palette index 0 (R,G,B)
+
+        # Next 128 entries (1..128) = original 16..143
+        tmp_pal_list.extend(full_pal[16 * 3:144 * 3])  # 128 * 3 bytes
+
+        # Now we have 1 + 128 = 129 colors so far (0..128).
+        # Pad to 256 entries so Pillow is happy.
+        num_colors_so_far = 1 + 128
+        tmp_pal_list.extend([0, 0, 0] * (256 - num_colors_so_far))
+
+        tmp_pal_img = Image.new("P", (1, 1))
+        tmp_pal_img.putpalette(tmp_pal_list)
+
+        # Quantize using the restricted palette
+        q = img_rgb.convert("RGB").quantize(
+            palette=tmp_pal_img,
             dither=Image.NONE
         )
+
+        # Remap indices:
+        #   0      -> 0
+        #   1..128 -> 16..143  (p -> p - 1 + 16)
+        q_data = list(q.getdata())
+        remapped = []
+        for p in q_data:
+            p = int(p)
+            if p == 0:
+                new_idx = 0
+            elif 1 <= p <= 128:
+                new_idx = (p - 1) + 16  # 16..143
+            else:
+                # Shouldn't happen, but clamp to 0 as a fallback
+                new_idx = 0
+            remapped.append(new_idx & 0xFF)
+
+        out = Image.new("P", q.size)
+        out.putdata(remapped)
+        # Attach the original ROM icon palette so indices map correctly
+        out.putpalette(full_pal)
+
+        return out
 
     def load_card_graphics(self):
         """
