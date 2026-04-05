@@ -3381,25 +3381,26 @@ class SetChronologyImportDialog(tk.Toplevel):
         self.check_vars = []
         self.card_entries = []
 
-        for card_name, rarity in self.app.set_chronology.get(set_name, []):
-            rar_idx = self.RARITY_MAP.get(rarity.strip().lower())
-            if rar_idx is None:
-                continue
-
+        for card_name, rarity_field in self.app.set_chronology.get(set_name, []):
             konami_ids = self.app._name_to_konami_ids(card_name)
             if not konami_ids:
                 continue
 
-            for kid in konami_ids:
-                row = len(self.card_entries)
-                var = tk.BooleanVar(value=True)
-                self.check_vars.append(var)
-                self.card_entries.append((kid, rar_idx))
+            for rarity in [r.strip() for r in rarity_field.split(",")]:
+                rar_idx = self.RARITY_MAP.get(rarity.lower())
+                if rar_idx is None:
+                    continue
 
-                label = f"{card_name}  [{rarity}]  (ID: {kid:04d})"
-                tk.Checkbutton(
-                    self.card_inner, text=label, variable=var, anchor="w"
-                ).grid(row=row, column=0, sticky="w", padx=2, pady=1)
+                for kid in konami_ids:
+                    row = len(self.card_entries)
+                    var = tk.BooleanVar(value=True)
+                    self.check_vars.append(var)
+                    self.card_entries.append((kid, rar_idx))
+
+                    label = f"{card_name}  [{rarity}]  (ID: {kid:04d})"
+                    tk.Checkbutton(
+                        self.card_inner, text=label, variable=var, anchor="w"
+                    ).grid(row=row, column=0, sticky="w", padx=2, pady=1)
 
         if not self.card_entries:
             tk.Label(
