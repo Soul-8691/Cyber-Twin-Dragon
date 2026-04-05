@@ -243,7 +243,9 @@ class RomEditorApp(tk.Tk):
         self.deck_names = []  # index -> name from text/decks.txt
 
         self.password_to_konami = {}  # password (int) -> konami_id
-        
+
+        self.set_chronology = None   # set_name -> list of (card_name, rarity_str)
+
         self.packs = []          # list[PackEntry]
         self.pack_names = []     # from text/packs.txt
         self.rarities = []       # from text/rarities.txt
@@ -825,6 +827,56 @@ class RomEditorApp(tk.Tk):
         self.konami_name_map = mapping
         self.ygo_cards_by_name = ygo_by_name
         self.ygo_card_names = sorted(ygo_names, key=str.lower)
+
+    def _load_set_chronology(self):
+        """
+        Lazily load Yu-Gi-Oh! - Set Chronology.tsv from the src/ directory.
+        Populates self.set_chronology: dict[set_name -> list[(card_name, rarity_str)]]
+        """
+        if self.set_chronology is not None:
+            return
+
+        self.set_chronology = {}
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base_dir = os.getcwd()
+
+        path = os.path.join(base_dir, "Yu-Gi-Oh! - Set Chronology.tsv")
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                first = True
+                for line in f:
+                    if first:
+                        first = False
+                        continue  # skip header
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 3:
+                        continue
+                    card_name, set_name, rarity = parts[0], parts[1], parts[2]
+                    if set_name not in self.set_chronology:
+                        self.set_chronology[set_name] = []
+                    self.set_chronology[set_name].append((card_name, rarity))
+        except Exception:
+            pass
+
+    def _name_to_konami_ids(self, card_name):
+        """
+        Look up a card name in ygo_cards_by_name, then map each card_images entry's
+        id (which is the password) through password_to_konami to get Konami IDs.
+        Returns a list of matching Konami IDs (empty if none found).
+        """
+        card_info = self.ygo_cards_by_name.get(card_name)
+        if card_info is None:
+            return []
+        konami_ids = []
+        for img in card_info.get("card_images", []):
+            pw = img.get("id")
+            if isinstance(pw, int):
+                kid = self.password_to_konami.get(pw)
+                if kid is not None and kid not in konami_ids:
+                    konami_ids.append(kid)
+        return konami_ids
 
     def _render_card_icons(self, card: CardEntry):
         """
@@ -3126,6 +3178,15 @@ class PackEditorWindow(tk.Toplevel):
         self.app._write_pack_to_rom(pack)
         messagebox.showinfo("Pack Editor", f"Pack {pack.index} saved to ROM.")
 
+    def _on_import_from_set_chronology(self):
+        self.app._load_set_chronology()
+        if not self.app.set_chronology:
+            messagebox.showerror(
+                "Import", "Yu-Gi-Oh! - Set Chronology.tsv not found or empty."
+            )
+            return
+        SetChronologyImportDialog(self, self)
+
     def _build_ui(self):
         main_frame = tk.Frame(self)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -3209,7 +3270,184 @@ class PackEditorWindow(tk.Toplevel):
         btn_frame.pack(fill=tk.X, pady=(6, 0))
 
         tk.Button(btn_frame, text="Save Pack Changes", command=self._on_save_clicked).pack(side=tk.LEFT)
+        tk.Button(
+            btn_frame, text="Import from Set Chronology...",
+            command=self._on_import_from_set_chronology
+        ).pack(side=tk.LEFT, padx=(6, 0))
         tk.Button(btn_frame, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+
+
+class SetChronologyImportDialog(tk.Toplevel):
+    """
+    Dialog for importing card names/rarities from Yu-Gi-Oh! - Set Chronology.tsv
+    into the currently-selected pack in the Pack Editor.
+
+    Rarity index mapping (1-indexed line numbers in rarities.txt, converted to 0-indexed):
+        Common / C       -> index 0  (line 1)
+        Rare / R         -> index 16 (line 17)
+        Secret Rare / ScR -> index 4 (line 5)
+        Ultra Rare / UR  -> index 8  (line 9)
+        Super Rare / SR  -> index 12 (line 13)
+    """
+
+    RARITY_MAP = {
+        "common":      0,
+        "c":           0,
+        "rare":        16,
+        "r":           16,
+        "secret rare": 4,
+        "scr":         4,
+        "ultra rare":  8,
+        "ur":          8,
+        "super rare":  12,
+        "sr":          12,
+    }
+
+    def __init__(self, parent, pack_editor: "PackEditorWindow"):
+        super().__init__(parent)
+        self.pack_editor = pack_editor
+        self.app = pack_editor.app
+        self.title("Import from Set Chronology")
+        self.resizable(True, True)
+
+        self.sorted_sets = []
+        self.check_vars = []    # BooleanVar per displayed card row
+        self.card_entries = []  # (konami_id, rarity_index) per displayed row
+
+        self._build_ui()
+
+    def _build_ui(self):
+        main = tk.Frame(self)
+        main.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # --- Left: set name listbox ---
+        left = tk.Frame(main)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+
+        tk.Label(left, text="Set:").pack(anchor="w")
+        self.set_listbox = tk.Listbox(left, width=44, height=28, exportselection=False)
+        self.set_listbox.pack(side=tk.LEFT, fill=tk.Y)
+        sb = tk.Scrollbar(left, orient=tk.VERTICAL, command=self.set_listbox.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.set_listbox.config(yscrollcommand=sb.set)
+        self.set_listbox.bind("<<ListboxSelect>>", self._on_set_selected)
+
+        self.sorted_sets = sorted(self.app.set_chronology.keys())
+        for s in self.sorted_sets:
+            self.set_listbox.insert(tk.END, s)
+
+        # --- Right: card list ---
+        right = tk.Frame(main)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+
+        tk.Label(right, text="Cards (recognized rarities only):").pack(anchor="w")
+
+        sel_row = tk.Frame(right)
+        sel_row.pack(fill=tk.X, pady=(0, 2))
+        tk.Button(sel_row, text="Select All",   command=self._select_all).pack(side=tk.LEFT)
+        tk.Button(sel_row, text="Deselect All", command=self._deselect_all).pack(side=tk.LEFT, padx=(4, 0))
+
+        card_outer = tk.Frame(right)
+        card_outer.pack(fill=tk.BOTH, expand=True)
+
+        self.card_canvas = tk.Canvas(card_outer, borderwidth=0)
+        self.card_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        card_sb = tk.Scrollbar(card_outer, orient="vertical", command=self.card_canvas.yview)
+        card_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.card_canvas.configure(yscrollcommand=card_sb.set)
+
+        self.card_inner = tk.Frame(self.card_canvas)
+        self.card_canvas.create_window((0, 0), window=self.card_inner, anchor="nw")
+        self.card_inner.bind(
+            "<Configure>",
+            lambda e: self.card_canvas.configure(scrollregion=self.card_canvas.bbox("all"))
+        )
+
+        # --- Bottom buttons ---
+        btn_frame = tk.Frame(self)
+        btn_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+        tk.Button(btn_frame, text="Import Checked", command=self._on_import).pack(side=tk.LEFT)
+        tk.Button(btn_frame, text="Close",          command=self.destroy).pack(side=tk.RIGHT)
+
+    def _on_set_selected(self, event):
+        sel = self.set_listbox.curselection()
+        if not sel:
+            return
+        self._populate_cards(self.sorted_sets[sel[0]])
+
+    def _populate_cards(self, set_name):
+        for child in self.card_inner.winfo_children():
+            child.destroy()
+        self.check_vars = []
+        self.card_entries = []
+
+        for card_name, rarity in self.app.set_chronology.get(set_name, []):
+            rar_idx = self.RARITY_MAP.get(rarity.strip().lower())
+            if rar_idx is None:
+                continue
+
+            konami_ids = self.app._name_to_konami_ids(card_name)
+            if not konami_ids:
+                continue
+
+            for kid in konami_ids:
+                row = len(self.card_entries)
+                var = tk.BooleanVar(value=True)
+                self.check_vars.append(var)
+                self.card_entries.append((kid, rar_idx))
+
+                label = f"{card_name}  [{rarity}]  (ID: {kid:04d})"
+                tk.Checkbutton(
+                    self.card_inner, text=label, variable=var, anchor="w"
+                ).grid(row=row, column=0, sticky="w", padx=2, pady=1)
+
+        if not self.card_entries:
+            tk.Label(
+                self.card_inner,
+                text="(No recognized cards found for this set)"
+            ).grid(row=0, column=0, padx=4, pady=4)
+
+    def _select_all(self):
+        for v in self.check_vars:
+            v.set(True)
+
+    def _deselect_all(self):
+        for v in self.check_vars:
+            v.set(False)
+
+    def _on_import(self):
+        new_contents = [
+            (kid, rar_idx)
+            for (kid, rar_idx), var in zip(self.card_entries, self.check_vars)
+            if var.get()
+        ]
+
+        if not new_contents:
+            messagebox.showinfo("Import", "No cards selected.")
+            return
+
+        pe = self.pack_editor
+        current_amount = pe.card_amount_var.get()
+        new_count = len(new_contents)
+
+        if new_count > current_amount:
+            if not messagebox.askyesno(
+                "Card Amount",
+                f"Importing {new_count} cards, but current Card Amount is {current_amount}.\n"
+                f"Expand Card Amount to {new_count}?"
+            ):
+                new_contents = new_contents[:current_amount]
+                new_count = current_amount
+
+        pack = pe.packs[pe.current_pack_index]
+        pack.contents = new_contents
+        pack.card_amount = new_count
+        pe.card_amount_var.set(new_count)
+        pe._rebuild_contents()
+
+        messagebox.showinfo("Import", f"Imported {new_count} card(s).")
+        self.destroy()
+
 
 class DeckEditorWindow(tk.Toplevel):
     def __init__(self, app: RomEditorApp):
