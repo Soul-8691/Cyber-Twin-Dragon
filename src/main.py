@@ -3325,16 +3325,25 @@ class SetChronologyImportDialog(tk.Toplevel):
         left.pack(side=tk.LEFT, fill=tk.Y)
 
         tk.Label(left, text="Set:").pack(anchor="w")
-        self.set_listbox = tk.Listbox(left, width=44, height=28, exportselection=False)
+
+        search_frame = tk.Frame(left)
+        search_frame.pack(fill=tk.X, pady=(0, 2))
+        self.set_search_var = tk.StringVar()
+        search_entry = tk.Entry(search_frame, textvariable=self.set_search_var)
+        search_entry.pack(fill=tk.X)
+        search_entry.bind("<Return>", self._on_search)
+
+        list_frame = tk.Frame(left)
+        list_frame.pack(fill=tk.Y, expand=True)
+        self.set_listbox = tk.Listbox(list_frame, width=44, height=27, exportselection=False)
         self.set_listbox.pack(side=tk.LEFT, fill=tk.Y)
-        sb = tk.Scrollbar(left, orient=tk.VERTICAL, command=self.set_listbox.yview)
+        sb = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.set_listbox.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.set_listbox.config(yscrollcommand=sb.set)
         self.set_listbox.bind("<<ListboxSelect>>", self._on_set_selected)
 
         self.sorted_sets = sorted(self.app.set_chronology.keys())
-        for s in self.sorted_sets:
-            self.set_listbox.insert(tk.END, s)
+        self._repopulate_set_list(self.sorted_sets)
 
         # --- Right: card list ---
         right = tk.Frame(main)
@@ -3369,11 +3378,25 @@ class SetChronologyImportDialog(tk.Toplevel):
         tk.Button(btn_frame, text="Import Checked", command=self._on_import).pack(side=tk.LEFT)
         tk.Button(btn_frame, text="Close",          command=self.destroy).pack(side=tk.RIGHT)
 
+    def _repopulate_set_list(self, sets):
+        self.set_listbox.delete(0, tk.END)
+        self._filtered_sets = list(sets)
+        for s in self._filtered_sets:
+            self.set_listbox.insert(tk.END, s)
+
+    def _on_search(self, event=None):
+        query = self.set_search_var.get().strip().lower()
+        if query:
+            matches = [s for s in self.sorted_sets if query in s.lower()]
+        else:
+            matches = self.sorted_sets
+        self._repopulate_set_list(matches)
+
     def _on_set_selected(self, event):
         sel = self.set_listbox.curselection()
         if not sel:
             return
-        self._populate_cards(self.sorted_sets[sel[0]])
+        self._populate_cards(self._filtered_sets[sel[0]])
 
     def _populate_cards(self, set_name):
         for child in self.card_inner.winfo_children():
